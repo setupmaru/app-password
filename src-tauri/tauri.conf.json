@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "App Password",
+  "version": "0.1.0",
+  "identifier": "com.local.apppassword",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "App Password",
+        "width": 1040,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 560,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "shortDescription": "선택한 앱을 마스터 비밀번호로 보호하는 로컬 런처",
+    "longDescription": "App Password는 선택한 Windows 응용 프로그램을 마스터 비밀번호 확인 후 실행하는 로컬 전용 런처입니다."
+  }
+}
+

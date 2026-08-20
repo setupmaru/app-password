@@ -1,0 +1,14 @@
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
+
+[profile.release]
+strip = true
+debug = 0
+lto = "thin"
+codegen-units = 1
+

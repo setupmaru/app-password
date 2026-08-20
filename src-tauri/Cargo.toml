@@ -1,0 +1,23 @@
+[package]
+name = "app-password"
+version = "0.1.0"
+description = "A local application launcher protected by a master password"
+authors = ["App Password"]
+edition = "2021"
+
+[lib]
+name = "app_password_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+argon2 = "0.5.3"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rfd = "0.15.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+tauri = { version = "2.11.5", features = ["tray-icon"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+
