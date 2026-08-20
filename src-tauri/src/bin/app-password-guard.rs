@@ -19,8 +19,8 @@ mod windows_guard {
     };
     use std::{
         collections::{HashMap, HashSet},
-        ffi::OsString,
-        fs,
+        ffi::{OsStr, OsString},
+        fs, io,
         sync::mpsc,
         time::Duration,
     };
@@ -28,11 +28,14 @@ mod windows_guard {
     use windows_service::{
         define_windows_service,
         service::{
-            ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus,
+            ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
+            ServiceExitCode, ServiceInfo, ServiceStartType, ServiceState, ServiceStatus,
             ServiceType,
         },
         service_control_handler::{self, ServiceControlHandlerResult},
-        service_dispatcher, Result,
+        service_dispatcher,
+        service_manager::{ServiceManager, ServiceManagerAccess},
+        Error, Result,
     };
 
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
@@ -40,7 +43,51 @@ mod windows_guard {
     const EVENT_THROTTLE_SECONDS: u64 = 2;
 
     pub fn run() -> Result<()> {
-        service_dispatcher::start(GUARD_SERVICE_NAME, ffi_service_main)
+        if std::env::args_os().nth(1).as_deref() == Some(OsStr::new("--install")) {
+            install_and_start()
+        } else {
+            service_dispatcher::start(GUARD_SERVICE_NAME, ffi_service_main)
+        }
+    }
+
+    fn install_and_start() -> Result<()> {
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )?;
+        let executable_path = std::env::current_exe().map_err(Error::Winapi)?;
+        let service_info = ServiceInfo {
+            name: OsString::from(GUARD_SERVICE_NAME),
+            display_name: OsString::from("App Password Guard"),
+            service_type: SERVICE_TYPE,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path,
+            launch_arguments: Vec::new(),
+            dependencies: Vec::new(),
+            account_name: None,
+            account_password: None,
+        };
+        let service = manager.create_service(
+            &service_info,
+            ServiceAccess::START | ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_STATUS,
+        )?;
+        service.set_description("App Password protected application process guard")?;
+        let arguments: [&OsStr; 0] = [];
+        service.start(&arguments)?;
+
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            match service.query_status()?.current_state {
+                ServiceState::Running => return Ok(()),
+                ServiceState::Stopped => break,
+                _ => {}
+            }
+        }
+
+        Err(Error::Winapi(io::Error::other(
+            "App Password Guard service did not reach the running state",
+        )))
     }
 
     define_windows_service!(ffi_service_main, service_main);
