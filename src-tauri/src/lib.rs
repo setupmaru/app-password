@@ -707,6 +707,22 @@ fn restore_dashboard_window(window: &WebviewWindow) -> Result<(), String> {
     window.center().map_err(|error| error.to_string())
 }
 
+fn show_dashboard_window(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        let _ = restore_dashboard_window(&window);
+        app.state::<AppState>()
+            .compact_auth_window
+            .store(false, Ordering::Release);
+        let _ = window.emit("compact-auth-closed", ());
+    }
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
 #[cfg(target_os = "windows")]
 mod windows_hello {
     use super::WebviewWindow;
@@ -1155,6 +1171,16 @@ fn launch_application(
 
     sync_guard_from_app_state(state.inner())?;
 
+    if application_is_running(&path) {
+        return Ok(LaunchResponse {
+            status: "authorized".into(),
+            message: format!("{}이(가) 이미 실행 중이므로 인증만 완료했습니다.", app.name),
+            attempts_remaining: MAX_FAILED_ATTEMPTS,
+            lockout_remaining_seconds: 0,
+            granted_until,
+        });
+    }
+
     let mut command = Command::new(&path);
     if let Some(parent) = path.parent() {
         command.current_dir(parent);
@@ -1170,6 +1196,25 @@ fn launch_application(
         lockout_remaining_seconds: 0,
         granted_until,
     })
+}
+
+#[cfg(target_os = "windows")]
+fn application_is_running(path: &Path) -> bool {
+    use sysinfo::{ProcessesToUpdate, System};
+
+    let expected_path = normalized_path_key(&path.to_string_lossy());
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, false);
+    system.processes().values().any(|process| {
+        process.exe().is_some_and(|executable| {
+            normalized_path_key(&executable.to_string_lossy()) == expected_path
+        })
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn application_is_running(_path: &Path) -> bool {
+    false
 }
 
 #[tauri::command]
@@ -1286,11 +1331,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(
             |app, _arguments, _cwd| {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
+                show_dashboard_window(app);
             },
         ))
         .setup(|app| {
@@ -1313,16 +1354,19 @@ pub fn run() {
                 .icon(make_tray_icon())
                 .tooltip("App Password")
                 .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                    let should_show = matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } | TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
                         }
+                    );
+                    if should_show {
+                        show_dashboard_window(tray.app_handle());
                     }
                 })
                 .build(app)?;

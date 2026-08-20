@@ -20,7 +20,7 @@ type Snapshot = {
 };
 
 type LaunchResponse = {
-  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched" | "helloCanceled" | "helloFailed";
+  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched" | "authorized" | "helloCanceled" | "helloFailed";
   message: string;
   attemptsRemaining: number;
   lockoutRemainingSeconds: number;
@@ -501,7 +501,7 @@ export default function App() {
           compact: false,
           helloAttempted: false,
         });
-      } else if (response.status === "launched") {
+      } else if (response.status === "launched" || response.status === "authorized") {
         setToast({ kind: "success", message: response.message });
         refresh();
       } else {
@@ -518,7 +518,7 @@ export default function App() {
     setAuth({ ...auth, busy: true, busyMethod: "password", message: "" });
     try {
       const response = await invoke<LaunchResponse>("launch_application", { id: auth.app.id, password: auth.password });
-      if (response.status === "launched") {
+      if (response.status === "launched" || response.status === "authorized") {
         if (auth.compact) {
           try { await invoke("dismiss_auth_window"); } catch { /* 앱 실행 성공은 유지합니다. */ }
         }
@@ -552,7 +552,7 @@ export default function App() {
     } : current);
     try {
       const response = await invoke<LaunchResponse>("launch_application_with_windows_hello", { id: activeAuth.app.id });
-      if (response.status === "launched") {
+      if (response.status === "launched" || response.status === "authorized") {
         if (activeAuth.compact) {
           try { await invoke("dismiss_auth_window"); } catch { /* 앱 실행 성공은 유지합니다. */ }
         }

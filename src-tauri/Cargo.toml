@@ -1,6 +1,6 @@
 [package]
 name = "app-password"
-version = "0.1.2"
+version = "0.1.3"
 description = "Protect Windows applications with a master password"
 authors = ["App Password"]
 edition = "2021"
