@@ -1,3 +1,5 @@
+pub mod guard_shared;
+
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -10,14 +12,20 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 use tauri::{
     image::Image,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, State,
+    Manager, State, WindowEvent,
 };
 use uuid::Uuid;
+
+use guard_shared::{guard_events_dir, guard_is_active, normalized_path_key, now_seconds};
+#[cfg(target_os = "windows")]
+use guard_shared::{
+    guard_state_path, save_guard_state, GuardApplication, GuardEvent, GuardStateFile,
+};
 
 const MAX_FAILED_ATTEMPTS: u32 = 5;
 const LOCKOUT_SECONDS: u64 = 30;
@@ -107,6 +115,7 @@ struct Snapshot {
     apps: Vec<AppView>,
     settings: Settings,
     lockout_remaining_seconds: u64,
+    guard_active: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,13 +132,6 @@ enum VerifyOutcome {
     Accepted,
     Rejected { attempts_remaining: u32 },
     Locked { seconds_remaining: u64 },
-}
-
-fn now_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
@@ -171,14 +173,6 @@ fn save_config(path: &Path, config: &Config) -> Result<(), String> {
     let contents = serde_json::to_string_pretty(config)
         .map_err(|error| format!("설정을 직렬화하지 못했습니다: {error}"))?;
     fs::write(path, contents).map_err(|error| format!("설정을 저장하지 못했습니다: {error}"))
-}
-
-fn normalized_path_key(path: &str) -> String {
-    path.trim()
-        .trim_matches('"')
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_lowercase()
 }
 
 #[cfg(target_os = "windows")]
@@ -528,6 +522,132 @@ fn verify_with_rate_limit(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn sync_guard_state(config: &Config, runtime: &RuntimeSecurity) -> Result<(), String> {
+    let Some(path) = guard_state_path() else {
+        return Err("Windows 보호 서비스 데이터 경로를 확인하지 못했습니다.".into());
+    };
+    let now = now_seconds();
+    let apps: Vec<GuardApplication> = config
+        .apps
+        .iter()
+        .filter(|app| app.protection_enabled)
+        .map(|app| GuardApplication {
+            name: app.name.clone(),
+            path: app.path.clone(),
+        })
+        .collect();
+    let grants = config
+        .apps
+        .iter()
+        .filter_map(|app| {
+            runtime
+                .grants
+                .get(&app.id)
+                .copied()
+                .filter(|expires_at| *expires_at > now)
+                .map(|expires_at| (normalized_path_key(&app.path), expires_at))
+        })
+        .collect();
+    save_guard_state(
+        &path,
+        &GuardStateFile {
+            schema_version: 1,
+            password_hash: config.password_hash.clone(),
+            apps,
+            grants,
+        },
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn sync_guard_state(_config: &Config, _runtime: &RuntimeSecurity) -> Result<(), String> {
+    Ok(())
+}
+
+fn sync_guard_from_app_state(state: &AppState) -> Result<(), String> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?
+        .clone();
+    let runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?;
+    sync_guard_state(&config, &runtime)
+}
+
+#[cfg(target_os = "windows")]
+fn take_guard_event(state: &AppState) -> Result<Option<AppView>, String> {
+    let Some(directory) = guard_events_dir() else {
+        return Ok(None);
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Ok(None);
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        let event = fs::read_to_string(&path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<GuardEvent>(&contents).ok());
+        let _ = fs::remove_file(&path);
+        let Some(event) = event else {
+            continue;
+        };
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?;
+        let Some(app) = config.apps.iter().find(|app| {
+            app.protection_enabled
+                && normalized_path_key(&app.path) == normalized_path_key(&event.path)
+        }) else {
+            continue;
+        };
+        let granted_until = state
+            .runtime
+            .lock()
+            .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?
+            .grants
+            .get(&app.id)
+            .copied();
+        return Ok(Some(AppView {
+            id: app.id.clone(),
+            name: app.name.clone(),
+            path: app.path.clone(),
+            protection_enabled: true,
+            exists: Path::new(&app.path).is_file(),
+            granted_until,
+        }));
+    }
+    Ok(None)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn take_guard_event(_state: &AppState) -> Result<Option<AppView>, String> {
+    Ok(None)
+}
+
+fn guard_event_waiting() -> bool {
+    guard_events_dir()
+        .and_then(|directory| fs::read_dir(directory).ok())
+        .is_some_and(|mut entries| {
+            entries.any(|entry| {
+                entry
+                    .ok()
+                    .and_then(|entry| entry.path().extension().map(|value| value == "json"))
+                    .unwrap_or(false)
+            })
+        })
+}
+
 fn current_snapshot_with_refresh(
     state: &AppState,
     force_refresh: bool,
@@ -563,6 +683,7 @@ fn current_snapshot_with_refresh(
         .map(|until| until.saturating_sub(now))
         .unwrap_or(0);
 
+    let _ = sync_guard_state(&config, &runtime);
     let apps = build_app_views(&config, installed, &runtime);
 
     Ok(Snapshot {
@@ -570,6 +691,7 @@ fn current_snapshot_with_refresh(
         apps,
         settings: config.settings.clone(),
         lockout_remaining_seconds,
+        guard_active: guard_is_active(),
     })
 }
 
@@ -585,6 +707,11 @@ fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
 #[tauri::command]
 fn refresh_installed_applications(state: State<'_, AppState>) -> Result<Snapshot, String> {
     current_snapshot_with_refresh(state.inner(), true)
+}
+
+#[tauri::command]
+fn poll_guard_event(state: State<'_, AppState>) -> Result<Option<AppView>, String> {
+    take_guard_event(state.inner())
 }
 
 #[tauri::command]
@@ -853,6 +980,8 @@ fn launch_application(
         });
     }
 
+    sync_guard_from_app_state(state.inner())?;
+
     let mut command = Command::new(&path);
     if let Some(parent) = path.parent() {
         command.current_dir(parent);
@@ -909,6 +1038,15 @@ fn make_tray_icon() -> Image<'static> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(
+            |app, _arguments, _cwd| {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            },
+        ))
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -941,11 +1079,38 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            if std::env::args_os().any(|argument| argument == "--background") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+
+            let app_handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                if guard_event_waiting() {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.unminimize();
+                        let _ = window.set_focus();
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            });
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             refresh_installed_applications,
+            poll_guard_event,
             set_master_password,
             change_master_password,
             set_application_protection,

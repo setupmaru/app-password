@@ -15,6 +15,7 @@ type Snapshot = {
   apps: ProtectedApp[];
   settings: { unlockMinutes: number };
   lockoutRemainingSeconds: number;
+  guardActive: boolean;
 };
 
 type LaunchResponse = {
@@ -334,12 +335,40 @@ export default function App() {
   useEffect(() => {
     refresh();
     const clockTimer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
-    const scanTimer = window.setInterval(refresh, 30_000);
+    const refreshTimer = window.setInterval(refresh, 3_000);
     return () => {
       window.clearInterval(clockTimer);
-      window.clearInterval(scanTimer);
+      window.clearInterval(refreshTimer);
     };
   }, [refresh]);
+
+  useEffect(() => {
+    if (!snapshot?.initialized) return;
+    let requestInFlight = false;
+    const poll = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const app = await invoke<ProtectedApp | null>("poll_guard_event");
+        if (app) {
+          setAuth((current) => current ?? {
+            app,
+            password: "",
+            message: "",
+            busy: false,
+            cooldown: snapshot.lockoutRemainingSeconds,
+          });
+        }
+      } catch {
+        // 서비스 상태는 상단 표시에서 별도로 갱신됩니다.
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 500);
+    return () => window.clearInterval(timer);
+  }, [snapshot?.initialized, snapshot?.lockoutRemainingSeconds]);
 
   useEffect(() => {
     if (!toast) return;
@@ -476,9 +505,12 @@ export default function App() {
       <main className="content">
         <section className="hero-row">
           <div>
-            <div className="eyebrow"><span className="status-dot" />로컬 보호 실행 중</div>
+            <div className={`eyebrow ${snapshot.guardActive ? "" : "eyebrow--danger"}`}>
+              <span className={`status-dot ${snapshot.guardActive ? "" : "status-dot--danger"}`} />
+              {snapshot.guardActive ? "Windows 보호 서비스 실행 중" : "Windows 보호 서비스 연결 안 됨"}
+            </div>
             <h1>Windows 앱</h1>
-            <p>설치된 앱을 자동으로 찾습니다. 보호할 앱의 토글을 켜세요.</p>
+            <p>토글을 켠 앱은 원래 실행 파일로 열어도 마스터 비밀번호로 보호됩니다.</p>
           </div>
           <button className="button button--primary" onClick={scanApplications} disabled={scanning}>
             {scanning ? <span className="spinner" /> : <Icon><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></Icon>}
@@ -564,10 +596,6 @@ export default function App() {
           )}
         </section>
 
-        <aside className="mode-notice">
-          <Icon size={20}><circle cx="12" cy="12" r="9" /><path d="M12 11v5m0-8h.01" /></Icon>
-          <div><strong>현재는 안전한 런처 보호 모드입니다.</strong><span>이 화면을 통하지 않고 원래 실행 파일을 직접 열면 우회할 수 있습니다. 다음 단계에서 Windows 시스템 서비스와 연결할 수 있습니다.</span></div>
-        </aside>
       </main>
 
       {auth && <AuthModal dialog={auth} onChange={(password) => setAuth({ ...auth, password, message: "" })} onClose={() => !auth.busy && setAuth(null)} onSubmit={authenticatedLaunch} />}

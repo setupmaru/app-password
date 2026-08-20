@@ -1,9 +1,10 @@
 [package]
 name = "app-password"
 version = "0.1.0"
-description = "A local application launcher protected by a master password"
+description = "Protect Windows applications with a master password"
 authors = ["App Password"]
 edition = "2021"
+default-run = "app-password"
 
 [lib]
 name = "app_password_lib"
@@ -18,7 +19,10 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.145"
 tauri = { version = "2.11.5", features = ["tray-icon"] }
+tauri-plugin-single-instance = "2.4.3"
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 winreg = "0.55.0"
+windows-service = "0.8.1"
