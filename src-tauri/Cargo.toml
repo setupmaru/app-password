@@ -1,6 +1,6 @@
 [package]
 name = "app-password"
-version = "0.1.1"
+version = "0.1.2"
 description = "Protect Windows applications with a master password"
 authors = ["App Password"]
 edition = "2021"
@@ -25,4 +25,6 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 [target.'cfg(windows)'.dependencies]
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 winreg = "0.55.0"
+windows = { version = "0.61.3", features = ["Foundation", "Security_Credentials_UI", "Win32_Foundation", "Win32_System_WinRT"] }
+windows-future = "0.2.1"
 windows-service = "0.8.1"

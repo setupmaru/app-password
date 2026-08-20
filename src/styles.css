@@ -51,6 +51,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .button:disabled { opacity: .45; cursor: not-allowed; }
 .button--primary { background: linear-gradient(135deg, var(--purple-bright), #6265e7); color: white; box-shadow: 0 8px 22px rgba(80, 82, 202, .25); }
 .button--primary:hover:not(:disabled) { background: linear-gradient(135deg, #9698ff, #7073ef); }
+.button--hello { color: #eef5ff; background: linear-gradient(135deg, #1267b5, #1885d1); border: 1px solid rgba(105, 190, 255, .3); box-shadow: 0 8px 22px rgba(20, 112, 187, .22); }
+.button--hello:hover:not(:disabled) { background: linear-gradient(135deg, #1778cf, #2095e3); }
 .button--secondary { background: var(--surface-2); color: #bfc6d5; border: 1px solid var(--border); }
 .button--secondary:hover:not(:disabled), .button--ghost:hover:not(:disabled) { background: var(--surface-3); }
 .button--ghost { background: transparent; border: 1px solid var(--border); color: #bfc6d5; }
@@ -144,6 +146,12 @@ input:focus { border-color: var(--purple); box-shadow: 0 0 0 3px rgba(111,114,24
 .modal > p { color: var(--muted); font-size: 12px; margin: 0 0 21px; }
 .modal form { text-align: left; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 20px; }
+.auth-divider { display: flex; align-items: center; gap: 10px; margin: 16px 0 2px; color: var(--subtle); font-size: 10px; }
+.auth-divider::before, .auth-divider::after { content: ""; height: 1px; flex: 1; background: var(--border); }
+.modal-backdrop--auth-window { padding: 0; background: #151c29; backdrop-filter: none; }
+.modal--auth-window { width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; border: 0; border-radius: 0; box-shadow: none; animation: fade-in .16s ease; }
+html.auth-window-mode, html.auth-window-mode body, html.auth-window-mode #root { width: 100%; height: 100%; min-height: 100%; overflow: hidden; }
+html.auth-window-mode .app-shell { height: 100vh; overflow: hidden; }
 .stacked-form .field-label { margin-top: 11px; }
 
 .toast { position: fixed; right: 25px; bottom: 25px; z-index: 130; max-width: min(390px, calc(100% - 40px)); padding: 12px 15px; display: flex; align-items: center; gap: 9px; border-radius: 10px; font-size: 12px; font-weight: 600; box-shadow: 0 16px 44px rgba(0,0,0,.34); animation: toast-in .22s ease; }

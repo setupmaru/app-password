@@ -11,13 +11,16 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 use tauri::{
     image::Image,
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, State, WindowEvent,
+    Emitter, LogicalSize, Manager, Size, State, WebviewWindow, WindowEvent,
 };
 use uuid::Uuid;
 
@@ -89,6 +92,7 @@ struct AppState {
     config: Mutex<Config>,
     runtime: Mutex<RuntimeSecurity>,
     installed_apps: Mutex<InstalledAppCache>,
+    compact_auth_window: AtomicBool,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +104,13 @@ struct AppView {
     protection_enabled: bool,
     exists: bool,
     granted_until: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GuardAuthRequest {
+    app: AppView,
+    compact: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -648,6 +659,148 @@ fn guard_event_waiting() -> bool {
         })
 }
 
+const DASHBOARD_WIDTH: f64 = 1040.0;
+const DASHBOARD_HEIGHT: f64 = 720.0;
+const DASHBOARD_MIN_WIDTH: f64 = 760.0;
+const DASHBOARD_MIN_HEIGHT: f64 = 560.0;
+const AUTH_WINDOW_WIDTH: f64 = 480.0;
+const AUTH_WINDOW_HEIGHT: f64 = 500.0;
+
+fn show_compact_auth_window(window: &WebviewWindow) -> Result<(), String> {
+    window
+        .set_min_size(None::<Size>)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_max_size(None::<Size>)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(LogicalSize::new(AUTH_WINDOW_WIDTH, AUTH_WINDOW_HEIGHT))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_resizable(false)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_always_on_top(true)
+        .map_err(|error| error.to_string())?;
+    window.center().map_err(|error| error.to_string())
+}
+
+fn restore_dashboard_window(window: &WebviewWindow) -> Result<(), String> {
+    window
+        .set_always_on_top(false)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_resizable(true)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_max_size(None::<Size>)
+        .map_err(|error| error.to_string())?;
+    window
+        .set_min_size(Some(LogicalSize::new(
+            DASHBOARD_MIN_WIDTH,
+            DASHBOARD_MIN_HEIGHT,
+        )))
+        .map_err(|error| error.to_string())?;
+    window
+        .set_size(LogicalSize::new(DASHBOARD_WIDTH, DASHBOARD_HEIGHT))
+        .map_err(|error| error.to_string())?;
+    window.center().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "windows")]
+mod windows_hello {
+    use super::WebviewWindow;
+    use windows::{
+        core::{factory, HSTRING},
+        Security::Credentials::UI::{
+            UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
+        },
+        Win32::System::WinRT::IUserConsentVerifierInterop,
+    };
+    use windows_future::IAsyncOperation;
+
+    pub(super) enum Verification {
+        Verified,
+        Canceled,
+        Failed(String),
+    }
+
+    fn interop() -> windows::core::Result<IUserConsentVerifierInterop> {
+        factory::<UserConsentVerifier, IUserConsentVerifierInterop>()
+    }
+
+    pub(super) fn is_available() -> bool {
+        if interop().is_err() {
+            return false;
+        }
+        UserConsentVerifier::CheckAvailabilityAsync()
+            .and_then(|operation| operation.get())
+            .is_ok_and(|availability| availability == UserConsentVerifierAvailability::Available)
+    }
+
+    pub(super) fn verify(window: WebviewWindow, app_name: String) -> Verification {
+        let result = (|| {
+            let hwnd = window.hwnd().map_err(|error| error.to_string())?;
+            let interop = interop().map_err(|error| error.to_string())?;
+            let message = HSTRING::from(format!("{app_name} 앱을 열려면 본인 확인이 필요합니다."));
+            let operation: IAsyncOperation<UserConsentVerificationResult> = unsafe {
+                interop
+                    .RequestVerificationForWindowAsync(hwnd, &message)
+                    .map_err(|error| error.to_string())?
+            };
+            operation.get().map_err(|error| error.to_string())
+        })();
+
+        match result {
+            Ok(UserConsentVerificationResult::Verified) => Verification::Verified,
+            Ok(UserConsentVerificationResult::Canceled) => Verification::Canceled,
+            Ok(UserConsentVerificationResult::DeviceBusy) => Verification::Failed(
+                "Windows Hello 장치가 사용 중입니다. 잠시 후 다시 시도해 주세요.".into(),
+            ),
+            Ok(UserConsentVerificationResult::RetriesExhausted) => Verification::Failed(
+                "Windows Hello 인증 시도 횟수를 초과했습니다. 마스터 비밀번호를 사용해 주세요."
+                    .into(),
+            ),
+            Ok(UserConsentVerificationResult::NotConfiguredForUser) => Verification::Failed(
+                "Windows Hello가 설정되어 있지 않습니다. 마스터 비밀번호를 사용해 주세요.".into(),
+            ),
+            Ok(UserConsentVerificationResult::DisabledByPolicy) => Verification::Failed(
+                "Windows 정책에서 Hello 인증을 허용하지 않습니다. 마스터 비밀번호를 사용해 주세요."
+                    .into(),
+            ),
+            Ok(UserConsentVerificationResult::DeviceNotPresent) => Verification::Failed(
+                "Windows Hello 장치를 찾지 못했습니다. 마스터 비밀번호를 사용해 주세요.".into(),
+            ),
+            Ok(_) => Verification::Failed(
+                "Windows Hello 인증을 완료하지 못했습니다. 마스터 비밀번호를 사용해 주세요.".into(),
+            ),
+            Err(error) => Verification::Failed(format!(
+                "Windows Hello를 시작하지 못했습니다. 마스터 비밀번호를 사용해 주세요. ({error})"
+            )),
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod windows_hello {
+    use super::WebviewWindow;
+
+    #[allow(dead_code)]
+    pub(super) enum Verification {
+        Verified,
+        Canceled,
+        Failed(String),
+    }
+
+    pub(super) fn is_available() -> bool {
+        false
+    }
+
+    pub(super) fn verify(_window: WebviewWindow, _app_name: String) -> Verification {
+        Verification::Failed("Windows Hello는 Windows에서만 사용할 수 있습니다.".into())
+    }
+}
+
 fn current_snapshot_with_refresh(
     state: &AppState,
     force_refresh: bool,
@@ -710,8 +863,28 @@ fn refresh_installed_applications(state: State<'_, AppState>) -> Result<Snapshot
 }
 
 #[tauri::command]
-fn poll_guard_event(state: State<'_, AppState>) -> Result<Option<AppView>, String> {
-    take_guard_event(state.inner())
+fn poll_guard_event(state: State<'_, AppState>) -> Result<Option<GuardAuthRequest>, String> {
+    Ok(
+        take_guard_event(state.inner())?.map(|app| GuardAuthRequest {
+            app,
+            compact: state.compact_auth_window.load(Ordering::Acquire),
+        }),
+    )
+}
+
+#[tauri::command]
+fn windows_hello_available() -> bool {
+    windows_hello::is_available()
+}
+
+#[tauri::command]
+fn dismiss_auth_window(window: WebviewWindow, state: State<'_, AppState>) -> Result<(), String> {
+    if state.compact_auth_window.load(Ordering::Acquire) {
+        window.hide().map_err(|error| error.to_string())?;
+        restore_dashboard_window(&window)?;
+        state.compact_auth_window.store(false, Ordering::Release);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -999,6 +1172,79 @@ fn launch_application(
     })
 }
 
+#[tauri::command]
+async fn launch_application_with_windows_hello(
+    id: String,
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<LaunchResponse, String> {
+    let (app_name, protection_enabled, unlock_minutes) = {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?;
+        let app = config
+            .apps
+            .iter()
+            .find(|app| app.id == id)
+            .ok_or_else(|| "응용 프로그램을 찾을 수 없습니다.".to_string())?;
+        (
+            app.name.clone(),
+            app.protection_enabled,
+            config.settings.unlock_minutes,
+        )
+    };
+
+    if !protection_enabled {
+        return launch_application(id, None, state);
+    }
+
+    let now = now_seconds();
+    let already_granted = state
+        .runtime
+        .lock()
+        .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?
+        .grants
+        .get(&id)
+        .is_some_and(|expires_at| *expires_at > now);
+    if already_granted {
+        return launch_application(id, None, state);
+    }
+
+    let verification =
+        tauri::async_runtime::spawn_blocking(move || windows_hello::verify(window, app_name))
+            .await
+            .map_err(|error| format!("Windows Hello 작업을 완료하지 못했습니다: {error}"))?;
+
+    match verification {
+        windows_hello::Verification::Verified => {
+            let expires_at = now_seconds() + u64::from(unlock_minutes) * 60;
+            state
+                .runtime
+                .lock()
+                .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?
+                .grants
+                .insert(id.clone(), expires_at);
+            sync_guard_from_app_state(state.inner())?;
+            launch_application(id, None, state)
+        }
+        windows_hello::Verification::Canceled => Ok(LaunchResponse {
+            status: "helloCanceled".into(),
+            message: "Windows Hello 인증이 취소되었습니다. 다시 시도하거나 마스터 비밀번호를 사용해 주세요.".into(),
+            attempts_remaining: MAX_FAILED_ATTEMPTS,
+            lockout_remaining_seconds: 0,
+            granted_until: None,
+        }),
+        windows_hello::Verification::Failed(message) => Ok(LaunchResponse {
+            status: "helloFailed".into(),
+            message,
+            attempts_remaining: MAX_FAILED_ATTEMPTS,
+            lockout_remaining_seconds: 0,
+            granted_until: None,
+        }),
+    }
+}
+
 fn make_tray_icon() -> Image<'static> {
     const SIZE: usize = 32;
     let mut rgba = vec![0_u8; SIZE * SIZE * 4];
@@ -1060,6 +1306,7 @@ pub fn run() {
                 config: Mutex::new(config),
                 runtime: Mutex::new(RuntimeSecurity::default()),
                 installed_apps: Mutex::new(InstalledAppCache::default()),
+                compact_auth_window: AtomicBool::new(false),
             });
 
             TrayIconBuilder::new()
@@ -1090,6 +1337,13 @@ pub fn run() {
             std::thread::spawn(move || loop {
                 if guard_event_waiting() {
                     if let Some(window) = app_handle.get_webview_window("main") {
+                        if !window.is_visible().unwrap_or(false) {
+                            app_handle
+                                .state::<AppState>()
+                                .compact_auth_window
+                                .store(true, Ordering::Release);
+                            let _ = show_compact_auth_window(&window);
+                        }
                         let _ = window.show();
                         let _ = window.unminimize();
                         let _ = window.set_focus();
@@ -1104,6 +1358,17 @@ pub fn run() {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
+                    if window
+                        .state::<AppState>()
+                        .compact_auth_window
+                        .swap(false, Ordering::AcqRel)
+                    {
+                        if let Some(webview_window) = window.app_handle().get_webview_window("main")
+                        {
+                            let _ = restore_dashboard_window(&webview_window);
+                        }
+                        let _ = window.emit("compact-auth-closed", ());
+                    }
                 }
             }
         })
@@ -1111,12 +1376,15 @@ pub fn run() {
             get_snapshot,
             refresh_installed_applications,
             poll_guard_event,
+            windows_hello_available,
+            dismiss_auth_window,
             set_master_password,
             change_master_password,
             set_application_protection,
             update_unlock_minutes,
             lock_all,
-            launch_application
+            launch_application,
+            launch_application_with_windows_hello
         ])
         .run(tauri::generate_context!())
         .expect("App Password를 실행하지 못했습니다.");

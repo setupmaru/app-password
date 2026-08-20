@@ -1,5 +1,6 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type ProtectedApp = {
   id: string;
@@ -19,7 +20,7 @@ type Snapshot = {
 };
 
 type LaunchResponse = {
-  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched";
+  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched" | "helloCanceled" | "helloFailed";
   message: string;
   attemptsRemaining: number;
   lockoutRemainingSeconds: number;
@@ -31,7 +32,15 @@ type AuthDialog = {
   password: string;
   message: string;
   busy: boolean;
+  busyMethod: "hello" | "password" | null;
   cooldown: number;
+  compact: boolean;
+  helloAttempted: boolean;
+};
+
+type GuardAuthRequest = {
+  app: ProtectedApp;
+  compact: boolean;
 };
 
 type Toast = { kind: "success" | "error"; message: string };
@@ -224,23 +233,36 @@ function SetupScreen({ onComplete }: { onComplete: (snapshot: Snapshot) => void 
   );
 }
 
-function AuthModal({ dialog, onChange, onClose, onSubmit }: {
+function AuthModal({ dialog, helloAvailable, onChange, onClose, onSubmit, onHello }: {
   dialog: AuthDialog;
+  helloAvailable: boolean;
   onChange: (password: string) => void;
   onClose: () => void;
   onSubmit: (event: FormEvent) => void;
+  onHello: () => void;
 }) {
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <div className={`modal-backdrop ${dialog.compact ? "modal-backdrop--auth-window" : ""}`} role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className={`modal ${dialog.compact ? "modal--auth-window" : ""}`} role="dialog" aria-modal="true" aria-labelledby="auth-title">
         <button className="icon-button modal-close" onClick={onClose} aria-label="닫기">
           <Icon><path d="m6 6 12 12M18 6 6 18" /></Icon>
         </button>
         <div className="modal-lock"><ShieldLogo /></div>
         <div className="eyebrow">보호된 앱</div>
         <h2 id="auth-title">{dialog.app.name} 열기</h2>
-        <p>계속하려면 마스터 비밀번호를 입력하세요.</p>
+        <p>{helloAvailable ? "Windows Hello 또는 마스터 비밀번호로 본인 확인을 해주세요." : "계속하려면 마스터 비밀번호를 입력하세요."}</p>
         <form onSubmit={onSubmit}>
+          {helloAvailable && (
+            <>
+              <button type="button" className="button button--hello button--wide" onClick={onHello} disabled={dialog.busy}>
+                {dialog.busyMethod === "hello" ? <span className="spinner" /> : (
+                  <Icon><path d="M8 3H5a2 2 0 0 0-2 2v3m13-5h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3m13 5h3a2 2 0 0 0 2-2v-3" /><path d="M9 10h.01M15 10h.01M9 15c1.8 1.3 4.2 1.3 6 0" /></Icon>
+                )}
+                {dialog.busyMethod === "hello" ? "Windows Hello 확인 중…" : "Windows Hello로 인증"}
+              </button>
+              <div className="auth-divider"><span>또는</span></div>
+            </>
+          )}
           <label className="field-label" htmlFor="unlock-password">마스터 비밀번호</label>
           <input
             id="unlock-password"
@@ -255,7 +277,7 @@ function AuthModal({ dialog, onChange, onClose, onSubmit }: {
           <div className="modal-actions">
             <button type="button" className="button button--ghost" onClick={onClose}>취소</button>
             <button className="button button--primary" disabled={dialog.busy || !dialog.password || dialog.cooldown > 0}>
-              {dialog.busy ? <span className="spinner" /> : dialog.cooldown > 0 ? `${dialog.cooldown}초 후 재시도` : "인증하고 실행"}
+              {dialog.busyMethod === "password" ? <span className="spinner" /> : dialog.cooldown > 0 ? `${dialog.cooldown}초 후 재시도` : "인증하고 실행"}
             </button>
           </div>
         </form>
@@ -319,6 +341,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
   const [auth, setAuth] = useState<AuthDialog | null>(null);
+  const [windowsHelloAvailable, setWindowsHelloAvailable] = useState(false);
   const [changingPassword, setChangingPassword] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
 
@@ -343,20 +366,45 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
+    invoke<boolean>("windows_hello_available")
+      .then(setWindowsHelloAvailable)
+      .catch(() => setWindowsHelloAvailable(false));
+
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen("compact-auth-closed", () => setAuth(null)).then((unlisten) => {
+      if (disposed) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("auth-window-mode", Boolean(auth?.compact));
+    return () => document.documentElement.classList.remove("auth-window-mode");
+  }, [auth?.compact]);
+
+  useEffect(() => {
     if (!snapshot?.initialized) return;
     let requestInFlight = false;
     const poll = async () => {
       if (requestInFlight) return;
       requestInFlight = true;
       try {
-        const app = await invoke<ProtectedApp | null>("poll_guard_event");
-        if (app) {
+        const request = await invoke<GuardAuthRequest | null>("poll_guard_event");
+        if (request) {
           setAuth((current) => current ?? {
-            app,
+            app: request.app,
             password: "",
             message: "",
             busy: false,
+            busyMethod: null,
             cooldown: snapshot.lockoutRemainingSeconds,
+            compact: request.compact,
+            helloAttempted: false,
           });
         }
       } catch {
@@ -383,6 +431,11 @@ export default function App() {
     }, 1000);
     return () => window.clearTimeout(timer);
   }, [auth]);
+
+  useEffect(() => {
+    if (!auth || !windowsHelloAvailable || auth.helloAttempted || auth.busy) return;
+    void authenticateWithWindowsHello();
+  }, [auth?.app.id, auth?.helloAttempted, auth?.busy, windowsHelloAvailable]);
 
   async function scanApplications() {
     setScanning(true);
@@ -438,7 +491,16 @@ export default function App() {
     try {
       const response = await invoke<LaunchResponse>("launch_application", { id: app.id, password: null });
       if (response.status === "needsPassword") {
-        setAuth({ app, password: "", message: "", busy: false, cooldown: snapshot?.lockoutRemainingSeconds ?? 0 });
+        setAuth({
+          app,
+          password: "",
+          message: "",
+          busy: false,
+          busyMethod: null,
+          cooldown: snapshot?.lockoutRemainingSeconds ?? 0,
+          compact: false,
+          helloAttempted: false,
+        });
       } else if (response.status === "launched") {
         setToast({ kind: "success", message: response.message });
         refresh();
@@ -453,10 +515,13 @@ export default function App() {
   async function authenticatedLaunch(event: FormEvent) {
     event.preventDefault();
     if (!auth) return;
-    setAuth({ ...auth, busy: true, message: "" });
+    setAuth({ ...auth, busy: true, busyMethod: "password", message: "" });
     try {
       const response = await invoke<LaunchResponse>("launch_application", { id: auth.app.id, password: auth.password });
       if (response.status === "launched") {
+        if (auth.compact) {
+          try { await invoke("dismiss_auth_window"); } catch { /* 앱 실행 성공은 유지합니다. */ }
+        }
         setAuth(null);
         setToast({ kind: "success", message: response.message });
         refresh();
@@ -465,12 +530,63 @@ export default function App() {
           ...current,
           password: "",
           busy: false,
+          busyMethod: null,
           message: response.message,
           cooldown: response.lockoutRemainingSeconds,
         } : null);
       }
     } catch (reason) {
-      setAuth((current) => current ? { ...current, busy: false, message: friendlyError(reason) } : null);
+      setAuth((current) => current ? { ...current, busy: false, busyMethod: null, message: friendlyError(reason) } : null);
+    }
+  }
+
+  async function authenticateWithWindowsHello() {
+    if (!auth || auth.busy || !windowsHelloAvailable) return;
+    const activeAuth = auth;
+    setAuth((current) => current && current.app.id === activeAuth.app.id ? {
+      ...current,
+      busy: true,
+      busyMethod: "hello",
+      helloAttempted: true,
+      message: "",
+    } : current);
+    try {
+      const response = await invoke<LaunchResponse>("launch_application_with_windows_hello", { id: activeAuth.app.id });
+      if (response.status === "launched") {
+        if (activeAuth.compact) {
+          try { await invoke("dismiss_auth_window"); } catch { /* 앱 실행 성공은 유지합니다. */ }
+        }
+        setAuth((current) => current?.app.id === activeAuth.app.id ? null : current);
+        setToast({ kind: "success", message: response.message });
+        refresh();
+      } else {
+        setAuth((current) => current?.app.id === activeAuth.app.id ? {
+          ...current,
+          busy: false,
+          busyMethod: null,
+          message: response.message,
+        } : current);
+      }
+    } catch (reason) {
+      setAuth((current) => current?.app.id === activeAuth.app.id ? {
+        ...current,
+        busy: false,
+        busyMethod: null,
+        message: friendlyError(reason),
+      } : current);
+    }
+  }
+
+  async function closeAuth() {
+    if (!auth || auth.busy) return;
+    const compact = auth.compact;
+    setAuth(null);
+    if (compact) {
+      try {
+        await invoke("dismiss_auth_window");
+      } catch (reason) {
+        setToast({ kind: "error", message: friendlyError(reason) });
+      }
     }
   }
 
@@ -598,7 +714,14 @@ export default function App() {
 
       </main>
 
-      {auth && <AuthModal dialog={auth} onChange={(password) => setAuth({ ...auth, password, message: "" })} onClose={() => !auth.busy && setAuth(null)} onSubmit={authenticatedLaunch} />}
+      {auth && <AuthModal
+        dialog={auth}
+        helloAvailable={windowsHelloAvailable}
+        onChange={(password) => setAuth({ ...auth, password, message: "" })}
+        onClose={() => void closeAuth()}
+        onSubmit={authenticatedLaunch}
+        onHello={() => void authenticateWithWindowsHello()}
+      />}
       {changingPassword && <ChangePasswordModal onClose={() => setChangingPassword(false)} onSaved={(next) => { setSnapshot(next); setChangingPassword(false); setToast({ kind: "success", message: "마스터 비밀번호를 변경하고 모든 앱을 다시 잠갔습니다." }); }} />}
       {toast && <div className={`toast toast--${toast.kind}`}><Icon>{toast.kind === "success" ? <path d="m5 12 4 4L19 6" /> : <><circle cx="12" cy="12" r="9" /><path d="M12 8v5m0 3h.01" /></>}</Icon>{toast.message}</div>}
     </div>
