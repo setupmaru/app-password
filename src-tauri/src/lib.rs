@@ -5,7 +5,7 @@ use argon2::{
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -70,10 +70,17 @@ struct RuntimeSecurity {
     grants: HashMap<String, u64>,
 }
 
+#[derive(Debug, Default)]
+struct InstalledAppCache {
+    scanned_at: u64,
+    apps: Vec<InstalledApplication>,
+}
+
 struct AppState {
     config_path: PathBuf,
     config: Mutex<Config>,
     runtime: Mutex<RuntimeSecurity>,
+    installed_apps: Mutex<InstalledAppCache>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +92,12 @@ struct AppView {
     protection_enabled: bool,
     exists: bool,
     granted_until: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct InstalledApplication {
+    name: String,
+    path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -160,6 +173,325 @@ fn save_config(path: &Path, config: &Config) -> Result<(), String> {
     fs::write(path, contents).map_err(|error| format!("설정을 저장하지 못했습니다: {error}"))
 }
 
+fn normalized_path_key(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+#[cfg(target_os = "windows")]
+mod installed_apps {
+    use super::{normalized_path_key, InstalledApplication};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+    };
+    use winreg::{
+        enums::{
+            HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+        },
+        RegKey,
+    };
+
+    const UNINSTALL_KEY: &str = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
+
+    fn expand_environment_variables(value: &str) -> String {
+        let mut expanded = value.to_string();
+        let mut cursor = 0;
+
+        while let Some(start_offset) = expanded[cursor..].find('%') {
+            let start = cursor + start_offset;
+            let Some(end_offset) = expanded[start + 1..].find('%') else {
+                break;
+            };
+            let end = start + 1 + end_offset;
+            let variable = &expanded[start + 1..end];
+            if variable.is_empty() {
+                cursor = end + 1;
+                continue;
+            }
+            if let Ok(replacement) = env::var(variable) {
+                expanded.replace_range(start..=end, &replacement);
+                cursor = start + replacement.len();
+            } else {
+                cursor = end + 1;
+            }
+        }
+
+        expanded
+    }
+
+    fn executable_from_reference(value: &str) -> Option<PathBuf> {
+        let expanded = expand_environment_variables(value);
+        let trimmed = expanded.trim();
+        let candidate = if let Some(quoted) = trimmed.strip_prefix('"') {
+            quoted.split('"').next()?
+        } else {
+            let lower = trimmed.to_lowercase();
+            let end = lower.find(".exe")? + 4;
+            &trimmed[..end]
+        };
+        let path = PathBuf::from(candidate.trim().trim_matches('"'));
+        path.is_file().then_some(path)
+    }
+
+    fn normalized_label(value: &str) -> String {
+        value
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+
+    fn is_helper_executable(path: &Path) -> bool {
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        [
+            "unins",
+            "uninstall",
+            "setup",
+            "update",
+            "updater",
+            "installer",
+            "repair",
+            "crash",
+            "helper",
+            "service",
+            "elevate",
+            "maintenance",
+        ]
+        .iter()
+        .any(|blocked| stem.contains(blocked))
+    }
+
+    fn collect_executables(
+        directory: &Path,
+        depth: u8,
+        remaining: &mut usize,
+        output: &mut Vec<PathBuf>,
+    ) {
+        if depth > 1 || *remaining == 0 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            if *remaining == 0 {
+                break;
+            }
+            *remaining -= 1;
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+                && !is_helper_executable(&path)
+            {
+                output.push(path);
+            } else if path.is_dir() {
+                collect_executables(&path, depth + 1, remaining, output);
+            }
+        }
+    }
+
+    fn executable_from_install_location(location: &str, display_name: &str) -> Option<PathBuf> {
+        let expanded = expand_environment_variables(location);
+        let directory = PathBuf::from(expanded.trim().trim_matches('"'));
+        if !directory.is_dir() {
+            return None;
+        }
+
+        let mut candidates = Vec::new();
+        let mut remaining = 300;
+        collect_executables(&directory, 0, &mut remaining, &mut candidates);
+        let display_key = normalized_label(display_name);
+
+        candidates.into_iter().max_by_key(|path| {
+            let file_key = normalized_label(
+                path.file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default(),
+            );
+            let name_score = if file_key == display_key {
+                20_000
+            } else if !file_key.is_empty()
+                && (display_key.contains(&file_key) || file_key.contains(&display_key))
+            {
+                10_000
+            } else {
+                0
+            };
+            let size_score = path
+                .metadata()
+                .map(|metadata| (metadata.len() / 1_000_000).min(5_000) as usize)
+                .unwrap_or(0);
+            name_score + size_score
+        })
+    }
+
+    fn should_skip_entry(key: &RegKey, display_name: &str) -> bool {
+        if key.get_value::<u32, _>("SystemComponent").unwrap_or(0) == 1
+            || key.get_value::<u32, _>("NoDisplay").unwrap_or(0) == 1
+        {
+            return true;
+        }
+
+        let release_type = key
+            .get_value::<String, _>("ReleaseType")
+            .unwrap_or_default()
+            .to_lowercase();
+        if ["update", "hotfix", "security update"]
+            .iter()
+            .any(|value| release_type.contains(value))
+        {
+            return true;
+        }
+
+        let name = display_name.to_lowercase();
+        name.starts_with("update for ")
+            || name.starts_with("security update for ")
+            || name.contains("webview2 runtime")
+            || name.contains("visual c++") && name.contains("redistributable")
+    }
+
+    pub(super) fn discover() -> Vec<InstalledApplication> {
+        let mut applications = Vec::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        let current_executable = env::current_exe()
+            .ok()
+            .map(|path| normalized_path_key(&path.to_string_lossy()));
+
+        for (root, view) in [
+            (HKEY_CURRENT_USER, KEY_WOW64_64KEY),
+            (HKEY_CURRENT_USER, KEY_WOW64_32KEY),
+            (HKEY_LOCAL_MACHINE, KEY_WOW64_64KEY),
+            (HKEY_LOCAL_MACHINE, KEY_WOW64_32KEY),
+        ] {
+            let root = RegKey::predef(root);
+            let Ok(uninstall) = root.open_subkey_with_flags(UNINSTALL_KEY, KEY_READ | view) else {
+                continue;
+            };
+
+            for subkey_name in uninstall.enum_keys().flatten() {
+                let Ok(entry) = uninstall.open_subkey_with_flags(&subkey_name, KEY_READ) else {
+                    continue;
+                };
+                let Ok(display_name) = entry.get_value::<String, _>("DisplayName") else {
+                    continue;
+                };
+                let display_name = display_name.trim();
+                if display_name.is_empty() || should_skip_entry(&entry, display_name) {
+                    continue;
+                }
+
+                let executable = entry
+                    .get_value::<String, _>("DisplayIcon")
+                    .ok()
+                    .and_then(|value| executable_from_reference(&value))
+                    .or_else(|| {
+                        entry
+                            .get_value::<String, _>("InstallLocation")
+                            .ok()
+                            .and_then(|value| {
+                                executable_from_install_location(&value, display_name)
+                            })
+                    });
+                let Some(executable) = executable else {
+                    continue;
+                };
+                let path = executable.to_string_lossy().to_string();
+                let path_key = normalized_path_key(&path);
+                if current_executable.as_ref() == Some(&path_key) || !seen_paths.insert(path_key) {
+                    continue;
+                }
+
+                applications.push(InstalledApplication {
+                    name: display_name.to_string(),
+                    path,
+                });
+            }
+        }
+
+        applications.sort_by_key(|application| application.name.to_lowercase());
+        applications
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn discover_installed_applications() -> Vec<InstalledApplication> {
+    installed_apps::discover()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn discover_installed_applications() -> Vec<InstalledApplication> {
+    Vec::new()
+}
+
+fn build_app_views(
+    config: &Config,
+    installed: Vec<InstalledApplication>,
+    runtime: &RuntimeSecurity,
+) -> Vec<AppView> {
+    let configured_by_path: HashMap<String, &ProtectedApp> = config
+        .apps
+        .iter()
+        .map(|app| (normalized_path_key(&app.path), app))
+        .collect();
+    let mut included_config_ids = HashSet::new();
+    let mut views = Vec::new();
+
+    for application in installed {
+        let path_key = normalized_path_key(&application.path);
+        let configured = configured_by_path.get(&path_key).copied();
+        if let Some(app) = configured {
+            included_config_ids.insert(app.id.clone());
+        }
+        views.push(AppView {
+            id: configured
+                .map(|app| app.id.clone())
+                .unwrap_or_else(|| format!("installed:{path_key}")),
+            name: application.name,
+            path: application.path,
+            protection_enabled: configured
+                .map(|app| app.protection_enabled)
+                .unwrap_or(false),
+            exists: true,
+            granted_until: configured.and_then(|app| runtime.grants.get(&app.id).copied()),
+        });
+    }
+
+    for app in config
+        .apps
+        .iter()
+        .filter(|app| !included_config_ids.contains(&app.id))
+    {
+        views.push(AppView {
+            id: app.id.clone(),
+            name: app.name.clone(),
+            path: app.path.clone(),
+            protection_enabled: app.protection_enabled,
+            exists: Path::new(&app.path).is_file(),
+            granted_until: runtime.grants.get(&app.id).copied(),
+        });
+    }
+
+    views.sort_by(|left, right| {
+        right
+            .protection_enabled
+            .cmp(&left.protection_enabled)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    views
+}
+
 fn verify_with_rate_limit(
     runtime: &mut RuntimeSecurity,
     password: &str,
@@ -196,11 +528,29 @@ fn verify_with_rate_limit(
     }
 }
 
-fn current_snapshot(state: &AppState) -> Result<Snapshot, String> {
+fn current_snapshot_with_refresh(
+    state: &AppState,
+    force_refresh: bool,
+) -> Result<Snapshot, String> {
     let config = state
         .config
         .lock()
-        .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?;
+        .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?
+        .clone();
+    let installed = if config.password_hash.is_some() {
+        let mut cache = state
+            .installed_apps
+            .lock()
+            .map_err(|_| "앱 목록 잠금이 손상되었습니다.".to_string())?;
+        let now = now_seconds();
+        if force_refresh || cache.scanned_at == 0 || now.saturating_sub(cache.scanned_at) >= 30 {
+            cache.apps = discover_installed_applications();
+            cache.scanned_at = now;
+        }
+        cache.apps.clone()
+    } else {
+        Vec::new()
+    };
     let mut runtime = state
         .runtime
         .lock()
@@ -213,18 +563,7 @@ fn current_snapshot(state: &AppState) -> Result<Snapshot, String> {
         .map(|until| until.saturating_sub(now))
         .unwrap_or(0);
 
-    let apps = config
-        .apps
-        .iter()
-        .map(|app| AppView {
-            id: app.id.clone(),
-            name: app.name.clone(),
-            path: app.path.clone(),
-            protection_enabled: app.protection_enabled,
-            exists: Path::new(&app.path).is_file(),
-            granted_until: runtime.grants.get(&app.id).copied(),
-        })
-        .collect();
+    let apps = build_app_views(&config, installed, &runtime);
 
     Ok(Snapshot {
         initialized: config.password_hash.is_some(),
@@ -234,9 +573,18 @@ fn current_snapshot(state: &AppState) -> Result<Snapshot, String> {
     })
 }
 
+fn current_snapshot(state: &AppState) -> Result<Snapshot, String> {
+    current_snapshot_with_refresh(state, false)
+}
+
 #[tauri::command]
 fn get_snapshot(state: State<'_, AppState>) -> Result<Snapshot, String> {
     current_snapshot(state.inner())
+}
+
+#[tauri::command]
+fn refresh_installed_applications(state: State<'_, AppState>) -> Result<Snapshot, String> {
+    current_snapshot_with_refresh(state.inner(), true)
 }
 
 #[tauri::command]
@@ -300,110 +648,73 @@ fn change_master_password(
 }
 
 #[tauri::command]
-fn add_application(state: State<'_, AppState>) -> Result<Option<Snapshot>, String> {
-    let mut dialog = rfd::FileDialog::new().set_title("보호할 응용 프로그램 선택");
-    #[cfg(target_os = "windows")]
-    {
-        dialog = dialog.add_filter("Windows 응용 프로그램", &["exe"]);
-    }
-
-    let Some(selected_path) = dialog.pick_file() else {
-        return Ok(None);
-    };
-    let canonical_path = selected_path
-        .canonicalize()
-        .map_err(|error| format!("선택한 파일을 확인하지 못했습니다: {error}"))?;
-
-    if !canonical_path.is_file() {
-        return Err("실행 가능한 파일을 선택해 주세요.".into());
-    }
-    #[cfg(target_os = "windows")]
-    if canonical_path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| !extension.eq_ignore_ascii_case("exe"))
-        .unwrap_or(true)
-    {
-        return Err("Windows 실행 파일(.exe)만 추가할 수 있습니다.".into());
-    }
-
-    let path_string = canonical_path.to_string_lossy().to_string();
-    let name = canonical_path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("응용 프로그램")
-        .to_string();
-
-    {
-        let mut config = state
-            .config
-            .lock()
-            .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?;
-        if config
-            .apps
-            .iter()
-            .any(|app| app.path.eq_ignore_ascii_case(&path_string))
-        {
-            return Err("이미 목록에 있는 응용 프로그램입니다.".into());
-        }
-        config.apps.push(ProtectedApp {
-            id: Uuid::new_v4().to_string(),
-            name,
-            path: path_string,
-            protection_enabled: true,
-        });
-        save_config(&state.config_path, &config)?;
-    }
-
-    current_snapshot(state.inner()).map(Some)
-}
-
-#[tauri::command]
-fn remove_application(id: String, state: State<'_, AppState>) -> Result<Snapshot, String> {
-    {
-        let mut config = state
-            .config
-            .lock()
-            .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?;
-        config.apps.retain(|app| app.id != id);
-        save_config(&state.config_path, &config)?;
-    }
-    state
-        .runtime
-        .lock()
-        .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?
-        .grants
-        .remove(&id);
-    current_snapshot(state.inner())
-}
-
-#[tauri::command]
-fn set_protection_enabled(
-    id: String,
+fn set_application_protection(
+    name: String,
+    path: String,
     enabled: bool,
     state: State<'_, AppState>,
 ) -> Result<Snapshot, String> {
+    let executable = PathBuf::from(path.trim());
+    if enabled
+        && (!executable.is_file()
+            || !executable
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")))
+    {
+        return Err("실행 가능한 Windows 앱을 찾을 수 없습니다.".into());
+    }
+
+    let path_key = normalized_path_key(&path);
+    let mut removed_ids = Vec::new();
     {
         let mut config = state
             .config
             .lock()
             .map_err(|_| "설정 잠금이 손상되었습니다.".to_string())?;
-        let app = config
-            .apps
-            .iter_mut()
-            .find(|app| app.id == id)
-            .ok_or_else(|| "응용 프로그램을 찾을 수 없습니다.".to_string())?;
-        app.protection_enabled = enabled;
+
+        if enabled {
+            if let Some(app) = config
+                .apps
+                .iter_mut()
+                .find(|app| normalized_path_key(&app.path) == path_key)
+            {
+                app.name = name.trim().to_string();
+                app.path = path.trim().to_string();
+                app.protection_enabled = true;
+            } else {
+                config.apps.push(ProtectedApp {
+                    id: Uuid::new_v4().to_string(),
+                    name: name.trim().to_string(),
+                    path: path.trim().to_string(),
+                    protection_enabled: true,
+                });
+            }
+        } else {
+            removed_ids.extend(
+                config
+                    .apps
+                    .iter()
+                    .filter(|app| normalized_path_key(&app.path) == path_key)
+                    .map(|app| app.id.clone()),
+            );
+            config
+                .apps
+                .retain(|app| normalized_path_key(&app.path) != path_key);
+        }
         save_config(&state.config_path, &config)?;
     }
-    if !enabled {
-        state
+
+    if !removed_ids.is_empty() {
+        let mut runtime = state
             .runtime
             .lock()
-            .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?
-            .grants
-            .remove(&id);
+            .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?;
+        for id in removed_ids {
+            runtime.grants.remove(&id);
+        }
     }
+
     current_snapshot(state.inner())
 }
 
@@ -610,6 +921,7 @@ pub fn run() {
                 config_path,
                 config: Mutex::new(config),
                 runtime: Mutex::new(RuntimeSecurity::default()),
+                installed_apps: Mutex::new(InstalledAppCache::default()),
             });
 
             TrayIconBuilder::new()
@@ -633,11 +945,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            refresh_installed_applications,
             set_master_password,
             change_master_password,
-            add_application,
-            remove_application,
-            set_protection_enabled,
+            set_application_protection,
             update_unlock_minutes,
             lock_all,
             launch_application
@@ -682,5 +993,34 @@ mod tests {
             verify_with_rate_limit(&mut runtime, "incorrect", &encoded),
             VerifyOutcome::Locked { .. }
         ));
+    }
+
+    #[test]
+    fn installed_apps_are_merged_with_protection_settings() {
+        let mut config = Config::default();
+        config.apps.push(ProtectedApp {
+            id: "protected-id".into(),
+            name: "Protected App".into(),
+            path: r"C:\Program Files\Protected\protected.exe".into(),
+            protection_enabled: true,
+        });
+        let installed = vec![
+            InstalledApplication {
+                name: "Protected App".into(),
+                path: r"c:\program files\protected\protected.exe".into(),
+            },
+            InstalledApplication {
+                name: "Discovered App".into(),
+                path: r"C:\Apps\discovered.exe".into(),
+            },
+        ];
+
+        let views = build_app_views(&config, installed, &RuntimeSecurity::default());
+
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, "protected-id");
+        assert!(views[0].protection_enabled);
+        assert_eq!(views[1].name, "Discovered App");
+        assert!(!views[1].protection_enabled);
     }
 }

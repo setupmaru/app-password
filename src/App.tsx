@@ -79,7 +79,7 @@ function formatRemaining(expiresAt: number | null, now: number) {
   return minutes > 0 ? `${minutes}분 ${rest}초 허용` : `${rest}초 허용`;
 }
 
-function EmptyState({ onAdd, busy }: { onAdd: () => void; busy: boolean }) {
+function EmptyState({ onRefresh, busy }: { onRefresh: () => void; busy: boolean }) {
   return (
     <section className="empty-state">
       <div className="empty-icon">
@@ -88,13 +88,13 @@ function EmptyState({ onAdd, busy }: { onAdd: () => void; busy: boolean }) {
           <path d="M12 8v8m-4-4h8" />
         </Icon>
       </div>
-      <h2>보호할 앱을 추가해 보세요</h2>
-      <p>실행 파일을 선택하면 App Password를 통해 안전하게 실행할 수 있습니다.</p>
-      <button className="button button--primary" onClick={onAdd} disabled={busy}>
+      <h2>설치된 앱을 찾지 못했습니다</h2>
+      <p>Windows 앱 설치 정보를 다시 검색해 실행 가능한 데스크톱 앱을 불러옵니다.</p>
+      <button className="button button--primary" onClick={onRefresh} disabled={busy}>
         <Icon>
-          <path d="M12 5v14m-7-7h14" />
+          <path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" />
         </Icon>
-        첫 번째 앱 추가
+        {busy ? "검색 중…" : "다시 검색"}
       </button>
     </section>
   );
@@ -148,7 +148,7 @@ function SetupScreen({ onComplete }: { onComplete: (snapshot: Snapshot) => void 
         <div className="eyebrow">처음 시작하기</div>
         <h1>나만의 앱 잠금</h1>
         <p className="setup-copy">
-          선택한 앱을 열기 전, 한 번 더 확인하세요. 모든 설정은 이 컴퓨터 안에만 저장됩니다.
+          Windows에 설치된 앱에서 보호할 항목을 켜세요. 모든 설정은 이 컴퓨터 안에만 저장됩니다.
         </p>
 
         <form onSubmit={submit} className="setup-form">
@@ -313,7 +313,9 @@ function ChangePasswordModal({ onClose, onSaved }: { onClose: () => void; onSave
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
-  const [adding, setAdding] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [togglingPath, setTogglingPath] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
   const [auth, setAuth] = useState<AuthDialog | null>(null);
   const [changingPassword, setChangingPassword] = useState(false);
@@ -331,8 +333,12 @@ export default function App() {
 
   useEffect(() => {
     refresh();
-    const timer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
-    return () => window.clearInterval(timer);
+    const clockTimer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    const scanTimer = window.setInterval(refresh, 30_000);
+    return () => {
+      window.clearInterval(clockTimer);
+      window.clearInterval(scanTimer);
+    };
   }, [refresh]);
 
   useEffect(() => {
@@ -349,36 +355,35 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [auth]);
 
-  async function addApplication() {
-    setAdding(true);
+  async function scanApplications() {
+    setScanning(true);
     try {
-      const next = await invoke<Snapshot | null>("add_application");
-      if (next) {
-        setSnapshot(next);
-        setToast({ kind: "success", message: "보호할 앱을 추가했습니다." });
-      }
+      setSnapshot(await invoke<Snapshot>("refresh_installed_applications"));
+      setToast({ kind: "success", message: "Windows 앱 목록을 새로 불러왔습니다." });
     } catch (reason) {
       setToast({ kind: "error", message: friendlyError(reason) });
     } finally {
-      setAdding(false);
+      setScanning(false);
     }
   }
 
   async function toggleProtection(app: ProtectedApp) {
+    setTogglingPath(app.path);
     try {
-      setSnapshot(await invoke<Snapshot>("set_protection_enabled", { id: app.id, enabled: !app.protectionEnabled }));
+      const enabled = !app.protectionEnabled;
+      setSnapshot(await invoke<Snapshot>("set_application_protection", {
+        name: app.name,
+        path: app.path,
+        enabled,
+      }));
+      setToast({
+        kind: "success",
+        message: enabled ? `${app.name} 보호를 켰습니다.` : `${app.name} 보호를 껐습니다.`,
+      });
     } catch (reason) {
       setToast({ kind: "error", message: friendlyError(reason) });
-    }
-  }
-
-  async function removeApplication(app: ProtectedApp) {
-    if (!window.confirm(`${app.name}을(를) 목록에서 제거할까요?\n실제 프로그램은 삭제되지 않습니다.`)) return;
-    try {
-      setSnapshot(await invoke<Snapshot>("remove_application", { id: app.id }));
-      setToast({ kind: "success", message: "목록에서 제거했습니다." });
-    } catch (reason) {
-      setToast({ kind: "error", message: friendlyError(reason) });
+    } finally {
+      setTogglingPath(null);
     }
   }
 
@@ -450,6 +455,12 @@ export default function App() {
 
   const protectedCount = snapshot.apps.filter((app) => app.protectionEnabled).length;
   const currentlyOpen = snapshot.apps.filter((app) => app.grantedUntil && app.grantedUntil > now).length;
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleApps = normalizedQuery
+    ? snapshot.apps.filter((app) =>
+        app.name.toLocaleLowerCase().includes(normalizedQuery)
+        || app.path.toLocaleLowerCase().includes(normalizedQuery))
+    : snapshot.apps;
 
   return (
     <div className="app-shell">
@@ -466,19 +477,19 @@ export default function App() {
         <section className="hero-row">
           <div>
             <div className="eyebrow"><span className="status-dot" />로컬 보호 실행 중</div>
-            <h1>보호된 앱</h1>
-            <p>앱을 열기 전 마스터 비밀번호로 본인임을 확인합니다.</p>
+            <h1>Windows 앱</h1>
+            <p>설치된 앱을 자동으로 찾습니다. 보호할 앱의 토글을 켜세요.</p>
           </div>
-          <button className="button button--primary" onClick={addApplication} disabled={adding}>
-            {adding ? <span className="spinner" /> : <Icon><path d="M12 5v14m-7-7h14" /></Icon>}
-            앱 추가
+          <button className="button button--primary" onClick={scanApplications} disabled={scanning}>
+            {scanning ? <span className="spinner" /> : <Icon><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></Icon>}
+            앱 새로고침
           </button>
         </section>
 
         <section className="summary-grid">
           <article className="summary-card">
             <span className="summary-icon summary-icon--purple"><Icon><rect x="4" y="4" width="16" height="16" rx="4" /><path d="M9 12h6m-3-3v6" /></Icon></span>
-            <div><strong>{snapshot.apps.length}</strong><span>등록된 앱</span></div>
+            <div><strong>{snapshot.apps.length}</strong><span>검색된 앱</span></div>
           </article>
           <article className="summary-card">
             <span className="summary-icon summary-icon--green"><Icon><path d="M12 3 5 6v5c0 4.4 2.8 8 7 10 4.2-2 7-5.6 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></Icon></span>
@@ -498,16 +509,25 @@ export default function App() {
 
         <section className="panel">
           <div className="panel-header">
-            <div><h2>앱 목록</h2><p>실행 버튼을 누르면 잠금 상태를 확인합니다.</p></div>
-            <button className="button button--secondary" onClick={lockAll} disabled={currentlyOpen === 0}>
-              <Icon><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></Icon>
-              지금 모두 잠그기
-            </button>
+            <div><h2>설치된 앱 목록</h2><p>30초마다 자동으로 확인하며, 토글을 켜면 보호 목록에 등록됩니다.</p></div>
+            <div className="panel-actions">
+              <label className="search-box">
+                <Icon size={16}><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></Icon>
+                <span className="sr-only">앱 검색</span>
+                <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="앱 이름 검색" />
+              </label>
+              <button className="button button--secondary" onClick={lockAll} disabled={currentlyOpen === 0}>
+                <Icon><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></Icon>
+                지금 모두 잠그기
+              </button>
+            </div>
           </div>
 
-          {snapshot.apps.length === 0 ? <EmptyState onAdd={addApplication} busy={adding} /> : (
+          {snapshot.apps.length === 0 ? <EmptyState onRefresh={scanApplications} busy={scanning} /> : visibleApps.length === 0 ? (
+            <div className="search-empty">“{query}”와 일치하는 앱이 없습니다.</div>
+          ) : (
             <div className="app-list">
-              {snapshot.apps.map((app) => {
+              {visibleApps.map((app) => {
                 const remaining = formatRemaining(app.grantedUntil, now);
                 return (
                   <article className="app-row" key={app.id}>
@@ -520,15 +540,22 @@ export default function App() {
                       <p title={app.path}>{app.path}</p>
                     </div>
                     <label className="switch" title="보호 사용">
-                      <input type="checkbox" checked={app.protectionEnabled} onChange={() => toggleProtection(app)} />
+                      <input
+                        type="checkbox"
+                        checked={app.protectionEnabled}
+                        disabled={togglingPath === app.path}
+                        onChange={() => toggleProtection(app)}
+                      />
                       <span className="switch-track"><span /></span>
                       <span className="sr-only">{app.name} 보호 사용</span>
                     </label>
-                    <button className="button button--launch" onClick={() => requestLaunch(app)} disabled={!app.exists}>
+                    <button
+                      className="button button--launch"
+                      onClick={() => requestLaunch(app)}
+                      disabled={!app.exists || !app.protectionEnabled}
+                      title={app.protectionEnabled ? "App Password로 실행" : "보호 토글을 먼저 켜세요"}
+                    >
                       <Icon><path d="m9 18 6-6-6-6" /></Icon>실행
-                    </button>
-                    <button className="icon-button icon-button--danger" onClick={() => removeApplication(app)} title="목록에서 제거">
-                      <Icon><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></Icon>
                     </button>
                   </article>
                 );
@@ -549,4 +576,3 @@ export default function App() {
     </div>
   );
 }
-
