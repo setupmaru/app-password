@@ -29,10 +29,17 @@
     ]
   },
   "bundle": {
-    "active": true,
-    "targets": "all",
-    "shortDescription": "선택한 앱을 마스터 비밀번호로 보호하는 로컬 런처",
-    "longDescription": "App Password는 선택한 Windows 응용 프로그램을 마스터 비밀번호 확인 후 실행하는 로컬 전용 런처입니다."
-  }
+  "active": true,
+  "targets": "all",
+  "icon": [
+    "icons/32x32.png",
+    "icons/128x128.png",
+    "icons/128x128@2x.png",
+    "icons/icon.icns",
+    "icons/icon.ico"
+  ],
+  "shortDescription": "선택한 앱을 마스터 비밀번호로 보호하는 로컬 런처",
+  "longDescription": "App Password는 선택한 Windows 응용 프로그램을 마스터 비밀번호 확인 후 실행하는 로컬 전용 런처입니다."
+}
 }
 
