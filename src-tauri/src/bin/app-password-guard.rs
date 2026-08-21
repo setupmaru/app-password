@@ -174,6 +174,21 @@ mod windows_guard {
 
             system.refresh_processes(ProcessesToUpdate::All, false);
             let current_pids: HashSet<Pid> = system.processes().keys().copied().collect();
+            let terminate_paths: HashSet<String> = state
+                .terminate_requests
+                .iter()
+                .filter(|(_, requested_at)| now.saturating_sub(**requested_at) <= 5)
+                .map(|(path, _)| path.clone())
+                .collect();
+
+            for process in system.processes().values() {
+                let Some(executable) = process.exe() else {
+                    continue;
+                };
+                if terminate_paths.contains(&normalized_path_key(&executable.to_string_lossy())) {
+                    let _ = process.kill();
+                }
+            }
 
             for pid in current_pids.difference(&known_pids) {
                 let Some(process) = system.process(*pid) else {
@@ -184,6 +199,9 @@ mod windows_guard {
                 };
                 let path = executable.to_string_lossy().to_string();
                 let path_key = normalized_path_key(&path);
+                if terminate_paths.contains(&path_key) {
+                    continue;
+                }
                 let Some(application) = protected.get(&path_key) else {
                     continue;
                 };

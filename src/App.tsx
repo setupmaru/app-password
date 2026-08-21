@@ -20,7 +20,7 @@ type Snapshot = {
 };
 
 type LaunchResponse = {
-  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched" | "authorized" | "helloCanceled" | "helloFailed";
+  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched" | "authorized" | "helloFailed";
   message: string;
   attemptsRemaining: number;
   lockoutRemainingSeconds: number;
@@ -254,11 +254,11 @@ function AuthModal({ dialog, helloAvailable, onChange, onClose, onSubmit, onHell
         <form onSubmit={onSubmit}>
           {helloAvailable && (
             <>
-              <button type="button" className="button button--hello button--wide" onClick={onHello} disabled={dialog.busy}>
+              <button type="button" className="button button--hello button--wide" onClick={onHello} disabled={dialog.busy || dialog.cooldown > 0}>
                 {dialog.busyMethod === "hello" ? <span className="spinner" /> : (
                   <Icon><path d="M8 3H5a2 2 0 0 0-2 2v3m13-5h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3m13 5h3a2 2 0 0 0 2-2v-3" /><path d="M9 10h.01M15 10h.01M9 15c1.8 1.3 4.2 1.3 6 0" /></Icon>
                 )}
-                {dialog.busyMethod === "hello" ? "Windows Hello 확인 중…" : "Windows Hello로 인증"}
+                {dialog.busyMethod === "hello" ? "Windows Hello 확인 중…" : dialog.cooldown > 0 ? `${dialog.cooldown}초 후 재시도` : "Windows Hello로 인증"}
               </button>
               <div className="auth-divider"><span>또는</span></div>
             </>
@@ -433,9 +433,9 @@ export default function App() {
   }, [auth]);
 
   useEffect(() => {
-    if (!auth || !windowsHelloAvailable || auth.helloAttempted || auth.busy) return;
+    if (!auth || !windowsHelloAvailable || auth.helloAttempted || auth.busy || auth.cooldown > 0) return;
     void authenticateWithWindowsHello();
-  }, [auth?.app.id, auth?.helloAttempted, auth?.busy, windowsHelloAvailable]);
+  }, [auth?.app.id, auth?.helloAttempted, auth?.busy, auth?.cooldown, windowsHelloAvailable]);
 
   async function scanApplications() {
     setScanning(true);
@@ -541,7 +541,7 @@ export default function App() {
   }
 
   async function authenticateWithWindowsHello() {
-    if (!auth || auth.busy || !windowsHelloAvailable) return;
+    if (!auth || auth.busy || auth.cooldown > 0 || !windowsHelloAvailable) return;
     const activeAuth = auth;
     setAuth((current) => current && current.app.id === activeAuth.app.id ? {
       ...current,
@@ -565,6 +565,7 @@ export default function App() {
           busy: false,
           busyMethod: null,
           message: response.message,
+          cooldown: response.lockoutRemainingSeconds,
         } : current);
       }
     } catch (reason) {

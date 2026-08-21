@@ -16,6 +16,8 @@ pub struct GuardStateFile {
     pub password_hash: Option<String>,
     pub apps: Vec<GuardApplication>,
     pub grants: HashMap<String, u64>,
+    #[serde(default)]
+    pub terminate_requests: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,5 +107,14 @@ mod tests {
             normalized_path_key(r#""C:/Program Files/Test/App.exe""#),
             normalized_path_key(r"c:\Program Files\Test\App.exe\")
         );
+    }
+
+    #[test]
+    fn older_guard_state_defaults_terminate_requests() {
+        let state: GuardStateFile = serde_json::from_str(
+            r#"{"schemaVersion":1,"passwordHash":null,"apps":[],"grants":{}}"#,
+        )
+        .expect("older guard state should remain readable");
+        assert!(state.terminate_requests.is_empty());
     }
 }

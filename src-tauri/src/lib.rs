@@ -79,6 +79,7 @@ struct RuntimeSecurity {
     failed_attempts: u32,
     locked_until: Option<u64>,
     grants: HashMap<String, u64>,
+    terminate_requests: HashMap<String, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -141,8 +142,13 @@ struct LaunchResponse {
 
 enum VerifyOutcome {
     Accepted,
-    Rejected { attempts_remaining: u32 },
-    Locked { seconds_remaining: u64 },
+    Rejected {
+        attempts_remaining: u32,
+    },
+    Locked {
+        seconds_remaining: u64,
+        newly_locked: bool,
+    },
 }
 
 fn hash_password(password: &str) -> Result<String, String> {
@@ -502,15 +508,12 @@ fn verify_with_rate_limit(
     password: &str,
     encoded_hash: &str,
 ) -> VerifyOutcome {
-    let now = now_seconds();
-    if let Some(locked_until) = runtime.locked_until {
-        if locked_until > now {
-            return VerifyOutcome::Locked {
-                seconds_remaining: locked_until - now,
-            };
-        }
-        runtime.locked_until = None;
-        runtime.failed_attempts = 0;
+    let seconds_remaining = lockout_remaining(runtime);
+    if seconds_remaining > 0 {
+        return VerifyOutcome::Locked {
+            seconds_remaining,
+            newly_locked: false,
+        };
     }
 
     if password_matches(password, encoded_hash) {
@@ -519,12 +522,40 @@ fn verify_with_rate_limit(
         return VerifyOutcome::Accepted;
     }
 
+    register_failed_attempt(runtime)
+}
+
+fn lockout_remaining(runtime: &mut RuntimeSecurity) -> u64 {
+    let now = now_seconds();
+    let remaining = runtime
+        .locked_until
+        .map(|locked_until| locked_until.saturating_sub(now))
+        .unwrap_or(0);
+    if remaining == 0 {
+        runtime.locked_until = None;
+        if runtime.failed_attempts >= MAX_FAILED_ATTEMPTS {
+            runtime.failed_attempts = 0;
+        }
+    }
+    remaining
+}
+
+fn register_failed_attempt(runtime: &mut RuntimeSecurity) -> VerifyOutcome {
+    let seconds_remaining = lockout_remaining(runtime);
+    if seconds_remaining > 0 {
+        return VerifyOutcome::Locked {
+            seconds_remaining,
+            newly_locked: false,
+        };
+    }
+
     runtime.failed_attempts += 1;
     if runtime.failed_attempts >= MAX_FAILED_ATTEMPTS {
         runtime.failed_attempts = 0;
-        runtime.locked_until = Some(now + LOCKOUT_SECONDS);
+        runtime.locked_until = Some(now_seconds() + LOCKOUT_SECONDS);
         VerifyOutcome::Locked {
             seconds_remaining: LOCKOUT_SECONDS,
+            newly_locked: true,
         }
     } else {
         VerifyOutcome::Rejected {
@@ -560,6 +591,12 @@ fn sync_guard_state(config: &Config, runtime: &RuntimeSecurity) -> Result<(), St
                 .map(|expires_at| (normalized_path_key(&app.path), expires_at))
         })
         .collect();
+    let terminate_requests = runtime
+        .terminate_requests
+        .iter()
+        .filter(|(_, requested_at)| now.saturating_sub(**requested_at) <= 5)
+        .map(|(path, requested_at)| (path.clone(), *requested_at))
+        .collect();
     save_guard_state(
         &path,
         &GuardStateFile {
@@ -567,6 +604,7 @@ fn sync_guard_state(config: &Config, runtime: &RuntimeSecurity) -> Result<(), St
             password_hash: config.password_hash.clone(),
             apps,
             grants,
+            terminate_requests,
         },
     )
 }
@@ -737,7 +775,7 @@ mod windows_hello {
 
     pub(super) enum Verification {
         Verified,
-        Canceled,
+        Rejected(String),
         Failed(String),
     }
 
@@ -769,14 +807,15 @@ mod windows_hello {
 
         match result {
             Ok(UserConsentVerificationResult::Verified) => Verification::Verified,
-            Ok(UserConsentVerificationResult::Canceled) => Verification::Canceled,
+            Ok(UserConsentVerificationResult::Canceled) => {
+                Verification::Rejected("Windows Hello 인증이 취소되었습니다.".into())
+            }
             Ok(UserConsentVerificationResult::DeviceBusy) => Verification::Failed(
                 "Windows Hello 장치가 사용 중입니다. 잠시 후 다시 시도해 주세요.".into(),
             ),
-            Ok(UserConsentVerificationResult::RetriesExhausted) => Verification::Failed(
-                "Windows Hello 인증 시도 횟수를 초과했습니다. 마스터 비밀번호를 사용해 주세요."
-                    .into(),
-            ),
+            Ok(UserConsentVerificationResult::RetriesExhausted) => {
+                Verification::Rejected("Windows Hello 인증에 실패했습니다.".into())
+            }
             Ok(UserConsentVerificationResult::NotConfiguredForUser) => Verification::Failed(
                 "Windows Hello가 설정되어 있지 않습니다. 마스터 비밀번호를 사용해 주세요.".into(),
             ),
@@ -804,7 +843,7 @@ mod windows_hello {
     #[allow(dead_code)]
     pub(super) enum Verification {
         Verified,
-        Canceled,
+        Rejected(String),
         Failed(String),
     }
 
@@ -847,6 +886,9 @@ fn current_snapshot_with_refresh(
     let now = now_seconds();
 
     runtime.grants.retain(|_, expires_at| *expires_at > now);
+    runtime
+        .terminate_requests
+        .retain(|_, requested_at| now.saturating_sub(*requested_at) <= 5);
     let lockout_remaining_seconds = runtime
         .locked_until
         .map(|until| until.saturating_sub(now))
@@ -953,12 +995,14 @@ fn change_master_password(
         config.password_hash = Some(new_hash);
         save_config(&state.config_path, &config)?;
     }
-    state
-        .runtime
-        .lock()
-        .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?
-        .grants
-        .clear();
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?;
+        runtime.grants.clear();
+        runtime.terminate_requests.clear();
+    }
 
     current_snapshot(state.inner())
 }
@@ -1029,6 +1073,7 @@ fn set_application_protection(
         for id in removed_ids {
             runtime.grants.remove(&id);
         }
+        runtime.terminate_requests.remove(&path_key);
     }
 
     current_snapshot(state.inner())
@@ -1133,26 +1178,22 @@ fn launch_application(
                     granted_until = Some(expires_at);
                 }
                 VerifyOutcome::Rejected { attempts_remaining } => {
-                    return Ok(LaunchResponse {
-                        status: "invalidPassword".into(),
-                        message: format!(
-                            "비밀번호가 올바르지 않습니다. {attempts_remaining}회 남았습니다."
-                        ),
+                    return rejected_authentication_response(
+                        &app,
                         attempts_remaining,
-                        lockout_remaining_seconds: 0,
-                        granted_until: None,
-                    });
+                        "비밀번호가 올바르지 않습니다.",
+                    );
                 }
-                VerifyOutcome::Locked { seconds_remaining } => {
-                    return Ok(LaunchResponse {
-                        status: "cooldown".into(),
-                        message: format!(
-                            "잠시 후 다시 시도해 주세요. {seconds_remaining}초 남았습니다."
-                        ),
-                        attempts_remaining: 0,
-                        lockout_remaining_seconds: seconds_remaining,
-                        granted_until: None,
-                    });
+                VerifyOutcome::Locked {
+                    seconds_remaining,
+                    newly_locked,
+                } => {
+                    return locked_authentication_response(
+                        &app,
+                        state.inner(),
+                        seconds_remaining,
+                        newly_locked,
+                    );
                 }
             }
         }
@@ -1199,22 +1240,167 @@ fn launch_application(
 }
 
 #[cfg(target_os = "windows")]
-fn application_is_running(path: &Path) -> bool {
+fn matching_application_processes(path: &Path) -> (sysinfo::System, HashSet<sysinfo::Pid>) {
     use sysinfo::{ProcessesToUpdate, System};
 
     let expected_path = normalized_path_key(&path.to_string_lossy());
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, false);
-    system.processes().values().any(|process| {
-        process.exe().is_some_and(|executable| {
-            normalized_path_key(&executable.to_string_lossy()) == expected_path
+    let pids = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            process
+                .exe()
+                .is_some_and(|executable| {
+                    normalized_path_key(&executable.to_string_lossy()) == expected_path
+                })
+                .then_some(*pid)
         })
-    })
+        .collect();
+    (system, pids)
+}
+
+#[cfg(target_os = "windows")]
+fn application_is_running(path: &Path) -> bool {
+    !matching_application_processes(path).1.is_empty()
+}
+
+#[cfg(target_os = "windows")]
+fn minimize_application_windows(path: &Path) -> Result<usize, String> {
+    use windows::{
+        core::BOOL,
+        Win32::{
+            Foundation::{HWND, LPARAM},
+            UI::WindowsAndMessaging::{
+                EnumWindows, GetWindowThreadProcessId, IsWindowVisible, ShowWindow, SW_MINIMIZE,
+            },
+        },
+    };
+
+    struct MinimizeContext {
+        pids: HashSet<u32>,
+        minimized: usize,
+    }
+
+    unsafe extern "system" fn minimize_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let context = unsafe { &mut *(lparam.0 as *mut MinimizeContext) };
+        let mut process_id = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+        if context.pids.contains(&process_id) && unsafe { IsWindowVisible(hwnd) }.as_bool() {
+            let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+            context.minimized += 1;
+        }
+        BOOL::from(true)
+    }
+
+    let (_, pids) = matching_application_processes(path);
+    let mut context = MinimizeContext {
+        pids: pids.into_iter().map(|pid| pid.as_u32()).collect(),
+        minimized: 0,
+    };
+    unsafe {
+        EnumWindows(
+            Some(minimize_window),
+            LPARAM((&mut context as *mut MinimizeContext) as isize),
+        )
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(context.minimized)
+}
+
+#[cfg(target_os = "windows")]
+fn terminate_application_processes(path: &Path) -> usize {
+    let (system, pids) = matching_application_processes(path);
+    pids.into_iter()
+        .filter(|pid| system.process(*pid).is_some_and(|process| process.kill()))
+        .count()
 }
 
 #[cfg(not(target_os = "windows"))]
 fn application_is_running(_path: &Path) -> bool {
     false
+}
+
+#[cfg(not(target_os = "windows"))]
+fn minimize_application_windows(_path: &Path) -> Result<usize, String> {
+    Ok(0)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminate_application_processes(_path: &Path) -> usize {
+    0
+}
+
+fn request_application_termination(path: &Path, state: &AppState) -> Result<(), String> {
+    {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?;
+        runtime
+            .terminate_requests
+            .insert(normalized_path_key(&path.to_string_lossy()), now_seconds());
+    }
+    sync_guard_from_app_state(state)?;
+    let _ = terminate_application_processes(path);
+    Ok(())
+}
+
+fn rejected_authentication_response(
+    app: &ProtectedApp,
+    attempts_remaining: u32,
+    failure_message: &str,
+) -> Result<LaunchResponse, String> {
+    let message = if attempts_remaining == 2 {
+        match minimize_application_windows(Path::new(&app.path)) {
+            Ok(0) => format!(
+                "인증이 누적 3회 실패했습니다. 실행 중인 {} 창이 없어 최소화할 항목은 없습니다. 2회 남았습니다.",
+                app.name
+            ),
+            Ok(count) => format!(
+                "인증이 누적 3회 실패하여 {} 창 {count}개를 최소화했습니다. 2회 남았습니다.",
+                app.name
+            ),
+            Err(error) => format!(
+                "인증이 누적 3회 실패했지만 {} 창을 최소화하지 못했습니다. 2회 남았습니다. ({error})",
+                app.name
+            ),
+        }
+    } else {
+        format!("{failure_message} {attempts_remaining}회 남았습니다.")
+    };
+    Ok(LaunchResponse {
+        status: "invalidPassword".into(),
+        message,
+        attempts_remaining,
+        lockout_remaining_seconds: 0,
+        granted_until: None,
+    })
+}
+
+fn locked_authentication_response(
+    app: &ProtectedApp,
+    state: &AppState,
+    seconds_remaining: u64,
+    newly_locked: bool,
+) -> Result<LaunchResponse, String> {
+    let message = if newly_locked {
+        request_application_termination(Path::new(&app.path), state)?;
+        format!(
+            "인증이 누적 5회 실패하여 {}을(를) 강제 종료했습니다. {seconds_remaining}초 후 다시 시도해 주세요.",
+            app.name
+        )
+    } else {
+        format!("잠시 후 다시 시도해 주세요. {seconds_remaining}초 남았습니다.")
+    };
+    Ok(LaunchResponse {
+        status: "cooldown".into(),
+        message,
+        attempts_remaining: 0,
+        lockout_remaining_seconds: seconds_remaining,
+        granted_until: None,
+    })
 }
 
 #[tauri::command]
@@ -1223,7 +1409,7 @@ async fn launch_application_with_windows_hello(
     window: WebviewWindow,
     state: State<'_, AppState>,
 ) -> Result<LaunchResponse, String> {
-    let (app_name, protection_enabled, unlock_minutes) = {
+    let (app, unlock_minutes) = {
         let config = state
             .config
             .lock()
@@ -1232,15 +1418,12 @@ async fn launch_application_with_windows_hello(
             .apps
             .iter()
             .find(|app| app.id == id)
+            .cloned()
             .ok_or_else(|| "응용 프로그램을 찾을 수 없습니다.".to_string())?;
-        (
-            app.name.clone(),
-            app.protection_enabled,
-            config.settings.unlock_minutes,
-        )
+        (app, config.settings.unlock_minutes)
     };
 
-    if !protection_enabled {
+    if !app.protection_enabled {
         return launch_application(id, None, state);
     }
 
@@ -1256,6 +1439,18 @@ async fn launch_application_with_windows_hello(
         return launch_application(id, None, state);
     }
 
+    let seconds_remaining = {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?;
+        lockout_remaining(&mut runtime)
+    };
+    if seconds_remaining > 0 {
+        return locked_authentication_response(&app, state.inner(), seconds_remaining, false);
+    }
+
+    let app_name = app.name.clone();
     let verification =
         tauri::async_runtime::spawn_blocking(move || windows_hello::verify(window, app_name))
             .await
@@ -1273,13 +1468,32 @@ async fn launch_application_with_windows_hello(
             sync_guard_from_app_state(state.inner())?;
             launch_application(id, None, state)
         }
-        windows_hello::Verification::Canceled => Ok(LaunchResponse {
-            status: "helloCanceled".into(),
-            message: "Windows Hello 인증이 취소되었습니다. 다시 시도하거나 마스터 비밀번호를 사용해 주세요.".into(),
-            attempts_remaining: MAX_FAILED_ATTEMPTS,
-            lockout_remaining_seconds: 0,
-            granted_until: None,
-        }),
+        windows_hello::Verification::Rejected(message) => {
+            let outcome = {
+                let mut runtime = state
+                    .runtime
+                    .lock()
+                    .map_err(|_| "보안 상태 잠금이 손상되었습니다.".to_string())?;
+                register_failed_attempt(&mut runtime)
+            };
+            match outcome {
+                VerifyOutcome::Rejected { attempts_remaining } => {
+                    rejected_authentication_response(&app, attempts_remaining, &message)
+                }
+                VerifyOutcome::Locked {
+                    seconds_remaining,
+                    newly_locked,
+                } => locked_authentication_response(
+                    &app,
+                    state.inner(),
+                    seconds_remaining,
+                    newly_locked,
+                ),
+                VerifyOutcome::Accepted => {
+                    Err("Windows Hello 실패 횟수를 처리하지 못했습니다.".into())
+                }
+            }
+        }
         windows_hello::Verification::Failed(message) => Ok(LaunchResponse {
             status: "helloFailed".into(),
             message,
@@ -1468,7 +1682,40 @@ mod tests {
         }
         assert!(matches!(
             verify_with_rate_limit(&mut runtime, "incorrect", &encoded),
-            VerifyOutcome::Locked { .. }
+            VerifyOutcome::Locked {
+                newly_locked: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            verify_with_rate_limit(&mut runtime, "incorrect", &encoded),
+            VerifyOutcome::Locked {
+                newly_locked: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn password_and_windows_hello_failures_share_counter() {
+        let encoded = hash_password("abcdefgh").expect("hash should be created");
+        let mut runtime = RuntimeSecurity::default();
+
+        let _ = verify_with_rate_limit(&mut runtime, "incorrect", &encoded);
+        let _ = verify_with_rate_limit(&mut runtime, "incorrect", &encoded);
+        assert!(matches!(
+            register_failed_attempt(&mut runtime),
+            VerifyOutcome::Rejected {
+                attempts_remaining: 2
+            }
+        ));
+        let _ = verify_with_rate_limit(&mut runtime, "incorrect", &encoded);
+        assert!(matches!(
+            register_failed_attempt(&mut runtime),
+            VerifyOutcome::Locked {
+                newly_locked: true,
+                ..
+            }
         ));
     }
 
