@@ -1,5 +1,6 @@
 import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type ProtectedApp = {
   id: string;
@@ -15,10 +16,11 @@ type Snapshot = {
   apps: ProtectedApp[];
   settings: { unlockMinutes: number };
   lockoutRemainingSeconds: number;
+  guardActive: boolean;
 };
 
 type LaunchResponse = {
-  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched";
+  status: "needsPassword" | "invalidPassword" | "cooldown" | "missing" | "launched" | "authorized" | "helloFailed";
   message: string;
   attemptsRemaining: number;
   lockoutRemainingSeconds: number;
@@ -30,7 +32,15 @@ type AuthDialog = {
   password: string;
   message: string;
   busy: boolean;
+  busyMethod: "hello" | "password" | null;
   cooldown: number;
+  compact: boolean;
+  helloAttempted: boolean;
+};
+
+type GuardAuthRequest = {
+  app: ProtectedApp;
+  compact: boolean;
 };
 
 type Toast = { kind: "success" | "error"; message: string };
@@ -79,7 +89,7 @@ function formatRemaining(expiresAt: number | null, now: number) {
   return minutes > 0 ? `${minutes}분 ${rest}초 허용` : `${rest}초 허용`;
 }
 
-function EmptyState({ onAdd, busy }: { onAdd: () => void; busy: boolean }) {
+function EmptyState({ onRefresh, busy }: { onRefresh: () => void; busy: boolean }) {
   return (
     <section className="empty-state">
       <div className="empty-icon">
@@ -88,13 +98,13 @@ function EmptyState({ onAdd, busy }: { onAdd: () => void; busy: boolean }) {
           <path d="M12 8v8m-4-4h8" />
         </Icon>
       </div>
-      <h2>보호할 앱을 추가해 보세요</h2>
-      <p>실행 파일을 선택하면 App Password를 통해 안전하게 실행할 수 있습니다.</p>
-      <button className="button button--primary" onClick={onAdd} disabled={busy}>
+      <h2>설치된 앱을 찾지 못했습니다</h2>
+      <p>Windows 앱 설치 정보를 다시 검색해 실행 가능한 데스크톱 앱을 불러옵니다.</p>
+      <button className="button button--primary" onClick={onRefresh} disabled={busy}>
         <Icon>
-          <path d="M12 5v14m-7-7h14" />
+          <path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" />
         </Icon>
-        첫 번째 앱 추가
+        {busy ? "검색 중…" : "다시 검색"}
       </button>
     </section>
   );
@@ -148,7 +158,7 @@ function SetupScreen({ onComplete }: { onComplete: (snapshot: Snapshot) => void 
         <div className="eyebrow">처음 시작하기</div>
         <h1>나만의 앱 잠금</h1>
         <p className="setup-copy">
-          선택한 앱을 열기 전, 한 번 더 확인하세요. 모든 설정은 이 컴퓨터 안에만 저장됩니다.
+          Windows에 설치된 앱에서 보호할 항목을 켜세요. 모든 설정은 이 컴퓨터 안에만 저장됩니다.
         </p>
 
         <form onSubmit={submit} className="setup-form">
@@ -223,23 +233,36 @@ function SetupScreen({ onComplete }: { onComplete: (snapshot: Snapshot) => void 
   );
 }
 
-function AuthModal({ dialog, onChange, onClose, onSubmit }: {
+function AuthModal({ dialog, helloAvailable, onChange, onClose, onSubmit, onHello }: {
   dialog: AuthDialog;
+  helloAvailable: boolean;
   onChange: (password: string) => void;
   onClose: () => void;
   onSubmit: (event: FormEvent) => void;
+  onHello: () => void;
 }) {
   return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <div className={`modal-backdrop ${dialog.compact ? "modal-backdrop--auth-window" : ""}`} role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <section className={`modal ${dialog.compact ? "modal--auth-window" : ""}`} role="dialog" aria-modal="true" aria-labelledby="auth-title">
         <button className="icon-button modal-close" onClick={onClose} aria-label="닫기">
           <Icon><path d="m6 6 12 12M18 6 6 18" /></Icon>
         </button>
         <div className="modal-lock"><ShieldLogo /></div>
         <div className="eyebrow">보호된 앱</div>
         <h2 id="auth-title">{dialog.app.name} 열기</h2>
-        <p>계속하려면 마스터 비밀번호를 입력하세요.</p>
+        <p>{helloAvailable ? "Windows Hello 또는 마스터 비밀번호로 본인 확인을 해주세요." : "계속하려면 마스터 비밀번호를 입력하세요."}</p>
         <form onSubmit={onSubmit}>
+          {helloAvailable && (
+            <>
+              <button type="button" className="button button--hello button--wide" onClick={onHello} disabled={dialog.busy || dialog.cooldown > 0}>
+                {dialog.busyMethod === "hello" ? <span className="spinner" /> : (
+                  <Icon><path d="M8 3H5a2 2 0 0 0-2 2v3m13-5h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3m13 5h3a2 2 0 0 0 2-2v-3" /><path d="M9 10h.01M15 10h.01M9 15c1.8 1.3 4.2 1.3 6 0" /></Icon>
+                )}
+                {dialog.busyMethod === "hello" ? "Windows Hello 확인 중…" : dialog.cooldown > 0 ? `${dialog.cooldown}초 후 재시도` : "Windows Hello로 인증"}
+              </button>
+              <div className="auth-divider"><span>또는</span></div>
+            </>
+          )}
           <label className="field-label" htmlFor="unlock-password">마스터 비밀번호</label>
           <input
             id="unlock-password"
@@ -254,7 +277,7 @@ function AuthModal({ dialog, onChange, onClose, onSubmit }: {
           <div className="modal-actions">
             <button type="button" className="button button--ghost" onClick={onClose}>취소</button>
             <button className="button button--primary" disabled={dialog.busy || !dialog.password || dialog.cooldown > 0}>
-              {dialog.busy ? <span className="spinner" /> : dialog.cooldown > 0 ? `${dialog.cooldown}초 후 재시도` : "인증하고 실행"}
+              {dialog.busyMethod === "password" ? <span className="spinner" /> : dialog.cooldown > 0 ? `${dialog.cooldown}초 후 재시도` : "인증하고 실행"}
             </button>
           </div>
         </form>
@@ -313,9 +336,12 @@ function ChangePasswordModal({ onClose, onSaved }: { onClose: () => void; onSave
 export default function App() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [loading, setLoading] = useState(true);
-  const [adding, setAdding] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [togglingPath, setTogglingPath] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
   const [now, setNow] = useState(() => Math.floor(Date.now() / 1000));
   const [auth, setAuth] = useState<AuthDialog | null>(null);
+  const [windowsHelloAvailable, setWindowsHelloAvailable] = useState(false);
   const [changingPassword, setChangingPassword] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
 
@@ -331,9 +357,66 @@ export default function App() {
 
   useEffect(() => {
     refresh();
-    const timer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
-    return () => window.clearInterval(timer);
+    const clockTimer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
+    const refreshTimer = window.setInterval(refresh, 3_000);
+    return () => {
+      window.clearInterval(clockTimer);
+      window.clearInterval(refreshTimer);
+    };
   }, [refresh]);
+
+  useEffect(() => {
+    invoke<boolean>("windows_hello_available")
+      .then(setWindowsHelloAvailable)
+      .catch(() => setWindowsHelloAvailable(false));
+
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
+    void listen("compact-auth-closed", () => setAuth(null)).then((unlisten) => {
+      if (disposed) unlisten();
+      else stopListening = unlisten;
+    });
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle("auth-window-mode", Boolean(auth?.compact));
+    return () => document.documentElement.classList.remove("auth-window-mode");
+  }, [auth?.compact]);
+
+  useEffect(() => {
+    if (!snapshot?.initialized) return;
+    let requestInFlight = false;
+    const poll = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+      try {
+        const request = await invoke<GuardAuthRequest | null>("poll_guard_event");
+        if (request) {
+          setAuth((current) => current ?? {
+            app: request.app,
+            password: "",
+            message: "",
+            busy: false,
+            busyMethod: null,
+            cooldown: snapshot.lockoutRemainingSeconds,
+            compact: request.compact,
+            helloAttempted: false,
+          });
+        }
+      } catch {
+        // 서비스 상태는 상단 표시에서 별도로 갱신됩니다.
+      } finally {
+        requestInFlight = false;
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 500);
+    return () => window.clearInterval(timer);
+  }, [snapshot?.initialized, snapshot?.lockoutRemainingSeconds]);
 
   useEffect(() => {
     if (!toast) return;
@@ -349,36 +432,40 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [auth]);
 
-  async function addApplication() {
-    setAdding(true);
+  useEffect(() => {
+    if (!auth || !windowsHelloAvailable || auth.helloAttempted || auth.busy || auth.cooldown > 0) return;
+    void authenticateWithWindowsHello();
+  }, [auth?.app.id, auth?.helloAttempted, auth?.busy, auth?.cooldown, windowsHelloAvailable]);
+
+  async function scanApplications() {
+    setScanning(true);
     try {
-      const next = await invoke<Snapshot | null>("add_application");
-      if (next) {
-        setSnapshot(next);
-        setToast({ kind: "success", message: "보호할 앱을 추가했습니다." });
-      }
+      setSnapshot(await invoke<Snapshot>("refresh_installed_applications"));
+      setToast({ kind: "success", message: "Windows 앱 목록을 새로 불러왔습니다." });
     } catch (reason) {
       setToast({ kind: "error", message: friendlyError(reason) });
     } finally {
-      setAdding(false);
+      setScanning(false);
     }
   }
 
   async function toggleProtection(app: ProtectedApp) {
+    setTogglingPath(app.path);
     try {
-      setSnapshot(await invoke<Snapshot>("set_protection_enabled", { id: app.id, enabled: !app.protectionEnabled }));
+      const enabled = !app.protectionEnabled;
+      setSnapshot(await invoke<Snapshot>("set_application_protection", {
+        name: app.name,
+        path: app.path,
+        enabled,
+      }));
+      setToast({
+        kind: "success",
+        message: enabled ? `${app.name} 보호를 켰습니다.` : `${app.name} 보호를 껐습니다.`,
+      });
     } catch (reason) {
       setToast({ kind: "error", message: friendlyError(reason) });
-    }
-  }
-
-  async function removeApplication(app: ProtectedApp) {
-    if (!window.confirm(`${app.name}을(를) 목록에서 제거할까요?\n실제 프로그램은 삭제되지 않습니다.`)) return;
-    try {
-      setSnapshot(await invoke<Snapshot>("remove_application", { id: app.id }));
-      setToast({ kind: "success", message: "목록에서 제거했습니다." });
-    } catch (reason) {
-      setToast({ kind: "error", message: friendlyError(reason) });
+    } finally {
+      setTogglingPath(null);
     }
   }
 
@@ -404,8 +491,17 @@ export default function App() {
     try {
       const response = await invoke<LaunchResponse>("launch_application", { id: app.id, password: null });
       if (response.status === "needsPassword") {
-        setAuth({ app, password: "", message: "", busy: false, cooldown: snapshot?.lockoutRemainingSeconds ?? 0 });
-      } else if (response.status === "launched") {
+        setAuth({
+          app,
+          password: "",
+          message: "",
+          busy: false,
+          busyMethod: null,
+          cooldown: snapshot?.lockoutRemainingSeconds ?? 0,
+          compact: false,
+          helloAttempted: false,
+        });
+      } else if (response.status === "launched" || response.status === "authorized") {
         setToast({ kind: "success", message: response.message });
         refresh();
       } else {
@@ -419,10 +515,13 @@ export default function App() {
   async function authenticatedLaunch(event: FormEvent) {
     event.preventDefault();
     if (!auth) return;
-    setAuth({ ...auth, busy: true, message: "" });
+    setAuth({ ...auth, busy: true, busyMethod: "password", message: "" });
     try {
       const response = await invoke<LaunchResponse>("launch_application", { id: auth.app.id, password: auth.password });
-      if (response.status === "launched") {
+      if (response.status === "launched" || response.status === "authorized") {
+        if (auth.compact) {
+          try { await invoke("dismiss_auth_window"); } catch { /* 앱 실행 성공은 유지합니다. */ }
+        }
         setAuth(null);
         setToast({ kind: "success", message: response.message });
         refresh();
@@ -431,12 +530,64 @@ export default function App() {
           ...current,
           password: "",
           busy: false,
+          busyMethod: null,
           message: response.message,
           cooldown: response.lockoutRemainingSeconds,
         } : null);
       }
     } catch (reason) {
-      setAuth((current) => current ? { ...current, busy: false, message: friendlyError(reason) } : null);
+      setAuth((current) => current ? { ...current, busy: false, busyMethod: null, message: friendlyError(reason) } : null);
+    }
+  }
+
+  async function authenticateWithWindowsHello() {
+    if (!auth || auth.busy || auth.cooldown > 0 || !windowsHelloAvailable) return;
+    const activeAuth = auth;
+    setAuth((current) => current && current.app.id === activeAuth.app.id ? {
+      ...current,
+      busy: true,
+      busyMethod: "hello",
+      helloAttempted: true,
+      message: "",
+    } : current);
+    try {
+      const response = await invoke<LaunchResponse>("launch_application_with_windows_hello", { id: activeAuth.app.id });
+      if (response.status === "launched" || response.status === "authorized") {
+        if (activeAuth.compact) {
+          try { await invoke("dismiss_auth_window"); } catch { /* 앱 실행 성공은 유지합니다. */ }
+        }
+        setAuth((current) => current?.app.id === activeAuth.app.id ? null : current);
+        setToast({ kind: "success", message: response.message });
+        refresh();
+      } else {
+        setAuth((current) => current?.app.id === activeAuth.app.id ? {
+          ...current,
+          busy: false,
+          busyMethod: null,
+          message: response.message,
+          cooldown: response.lockoutRemainingSeconds,
+        } : current);
+      }
+    } catch (reason) {
+      setAuth((current) => current?.app.id === activeAuth.app.id ? {
+        ...current,
+        busy: false,
+        busyMethod: null,
+        message: friendlyError(reason),
+      } : current);
+    }
+  }
+
+  async function closeAuth() {
+    if (!auth || auth.busy) return;
+    const compact = auth.compact;
+    setAuth(null);
+    if (compact) {
+      try {
+        await invoke("dismiss_auth_window");
+      } catch (reason) {
+        setToast({ kind: "error", message: friendlyError(reason) });
+      }
     }
   }
 
@@ -450,6 +601,12 @@ export default function App() {
 
   const protectedCount = snapshot.apps.filter((app) => app.protectionEnabled).length;
   const currentlyOpen = snapshot.apps.filter((app) => app.grantedUntil && app.grantedUntil > now).length;
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleApps = normalizedQuery
+    ? snapshot.apps.filter((app) =>
+        app.name.toLocaleLowerCase().includes(normalizedQuery)
+        || app.path.toLocaleLowerCase().includes(normalizedQuery))
+    : snapshot.apps;
 
   return (
     <div className="app-shell">
@@ -465,20 +622,23 @@ export default function App() {
       <main className="content">
         <section className="hero-row">
           <div>
-            <div className="eyebrow"><span className="status-dot" />로컬 보호 실행 중</div>
-            <h1>보호된 앱</h1>
-            <p>앱을 열기 전 마스터 비밀번호로 본인임을 확인합니다.</p>
+            <div className={`eyebrow ${snapshot.guardActive ? "" : "eyebrow--danger"}`}>
+              <span className={`status-dot ${snapshot.guardActive ? "" : "status-dot--danger"}`} />
+              {snapshot.guardActive ? "Windows 보호 서비스 실행 중" : "Windows 보호 서비스 연결 안 됨"}
+            </div>
+            <h1>Windows 앱</h1>
+            <p>토글을 켠 앱은 원래 실행 파일로 열어도 마스터 비밀번호로 보호됩니다.</p>
           </div>
-          <button className="button button--primary" onClick={addApplication} disabled={adding}>
-            {adding ? <span className="spinner" /> : <Icon><path d="M12 5v14m-7-7h14" /></Icon>}
-            앱 추가
+          <button className="button button--primary" onClick={scanApplications} disabled={scanning}>
+            {scanning ? <span className="spinner" /> : <Icon><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" /></Icon>}
+            앱 새로고침
           </button>
         </section>
 
         <section className="summary-grid">
           <article className="summary-card">
             <span className="summary-icon summary-icon--purple"><Icon><rect x="4" y="4" width="16" height="16" rx="4" /><path d="M9 12h6m-3-3v6" /></Icon></span>
-            <div><strong>{snapshot.apps.length}</strong><span>등록된 앱</span></div>
+            <div><strong>{snapshot.apps.length}</strong><span>검색된 앱</span></div>
           </article>
           <article className="summary-card">
             <span className="summary-icon summary-icon--green"><Icon><path d="M12 3 5 6v5c0 4.4 2.8 8 7 10 4.2-2 7-5.6 7-10V6l-7-3Z" /><path d="m9 12 2 2 4-4" /></Icon></span>
@@ -498,16 +658,25 @@ export default function App() {
 
         <section className="panel">
           <div className="panel-header">
-            <div><h2>앱 목록</h2><p>실행 버튼을 누르면 잠금 상태를 확인합니다.</p></div>
-            <button className="button button--secondary" onClick={lockAll} disabled={currentlyOpen === 0}>
-              <Icon><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></Icon>
-              지금 모두 잠그기
-            </button>
+            <div><h2>설치된 앱 목록</h2><p>30초마다 자동으로 확인하며, 토글을 켜면 보호 목록에 등록됩니다.</p></div>
+            <div className="panel-actions">
+              <label className="search-box">
+                <Icon size={16}><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></Icon>
+                <span className="sr-only">앱 검색</span>
+                <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="앱 이름 검색" />
+              </label>
+              <button className="button button--secondary" onClick={lockAll} disabled={currentlyOpen === 0}>
+                <Icon><rect x="5" y="10" width="14" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></Icon>
+                지금 모두 잠그기
+              </button>
+            </div>
           </div>
 
-          {snapshot.apps.length === 0 ? <EmptyState onAdd={addApplication} busy={adding} /> : (
+          {snapshot.apps.length === 0 ? <EmptyState onRefresh={scanApplications} busy={scanning} /> : visibleApps.length === 0 ? (
+            <div className="search-empty">“{query}”와 일치하는 앱이 없습니다.</div>
+          ) : (
             <div className="app-list">
-              {snapshot.apps.map((app) => {
+              {visibleApps.map((app) => {
                 const remaining = formatRemaining(app.grantedUntil, now);
                 return (
                   <article className="app-row" key={app.id}>
@@ -520,15 +689,22 @@ export default function App() {
                       <p title={app.path}>{app.path}</p>
                     </div>
                     <label className="switch" title="보호 사용">
-                      <input type="checkbox" checked={app.protectionEnabled} onChange={() => toggleProtection(app)} />
+                      <input
+                        type="checkbox"
+                        checked={app.protectionEnabled}
+                        disabled={togglingPath === app.path}
+                        onChange={() => toggleProtection(app)}
+                      />
                       <span className="switch-track"><span /></span>
                       <span className="sr-only">{app.name} 보호 사용</span>
                     </label>
-                    <button className="button button--launch" onClick={() => requestLaunch(app)} disabled={!app.exists}>
+                    <button
+                      className="button button--launch"
+                      onClick={() => requestLaunch(app)}
+                      disabled={!app.exists || !app.protectionEnabled}
+                      title={app.protectionEnabled ? "App Password로 실행" : "보호 토글을 먼저 켜세요"}
+                    >
                       <Icon><path d="m9 18 6-6-6-6" /></Icon>실행
-                    </button>
-                    <button className="icon-button icon-button--danger" onClick={() => removeApplication(app)} title="목록에서 제거">
-                      <Icon><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6" /></Icon>
                     </button>
                   </article>
                 );
@@ -537,16 +713,18 @@ export default function App() {
           )}
         </section>
 
-        <aside className="mode-notice">
-          <Icon size={20}><circle cx="12" cy="12" r="9" /><path d="M12 11v5m0-8h.01" /></Icon>
-          <div><strong>현재는 안전한 런처 보호 모드입니다.</strong><span>이 화면을 통하지 않고 원래 실행 파일을 직접 열면 우회할 수 있습니다. 다음 단계에서 Windows 시스템 서비스와 연결할 수 있습니다.</span></div>
-        </aside>
       </main>
 
-      {auth && <AuthModal dialog={auth} onChange={(password) => setAuth({ ...auth, password, message: "" })} onClose={() => !auth.busy && setAuth(null)} onSubmit={authenticatedLaunch} />}
+      {auth && <AuthModal
+        dialog={auth}
+        helloAvailable={windowsHelloAvailable}
+        onChange={(password) => setAuth({ ...auth, password, message: "" })}
+        onClose={() => void closeAuth()}
+        onSubmit={authenticatedLaunch}
+        onHello={() => void authenticateWithWindowsHello()}
+      />}
       {changingPassword && <ChangePasswordModal onClose={() => setChangingPassword(false)} onSaved={(next) => { setSnapshot(next); setChangingPassword(false); setToast({ kind: "success", message: "마스터 비밀번호를 변경하고 모든 앱을 다시 잠갔습니다." }); }} />}
       {toast && <div className={`toast toast--${toast.kind}`}><Icon>{toast.kind === "success" ? <path d="m5 12 4 4L19 6" /> : <><circle cx="12" cy="12" r="9" /><path d="M12 8v5m0 3h.01" /></>}</Icon>{toast.message}</div>}
     </div>
   );
 }
-

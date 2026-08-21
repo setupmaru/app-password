@@ -31,8 +31,16 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build Windows guard service
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          New-Item -ItemType File -Force src-tauri/binaries/app-password-guard-x86_64-pc-windows-msvc.exe | Out-Null
+          cargo build --manifest-path src-tauri/Cargo.toml --release --bin app-password-guard
+          Copy-Item src-tauri/target/release/app-password-guard.exe src-tauri/binaries/app-password-guard-x86_64-pc-windows-msvc.exe
+
       - name: Build Windows app
-        run: npm run tauri build
+        run: npm run tauri build -- --bundles nsis
 
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
@@ -41,5 +49,4 @@ jobs:
           path: |
             src-tauri/target/release/*.exe
             src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: warn
